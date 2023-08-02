@@ -21,6 +21,7 @@ tcp_accept(int listenfd) {
 	int clientfd;
 	struct sockaddr_in client_sin;
 	socklen_t sin_len = sizeof(client_sin);
+	char s[32];
 
 	if((clientfd = accept(listenfd, (struct sockaddr *)&client_sin, &sin_len)) < 0) {
 		perror("accept");
@@ -36,7 +37,11 @@ tcp_accept(int listenfd) {
 		return NULL;
 
 	t->fd = clientfd;
-	t->port = ntohs(client_sin.sin_port);
+	memcpy(&t->addr, &client_sin, sin_len);
+
+	inet_ntop(AF_INET, &t->addr.sin_addr, s, 32);
+	printf("accept @%s\n", s);
+
 	return t;
 }
 
@@ -51,6 +56,7 @@ connect_tcp(const char *host, int port) {
 	TCP *t;
 	struct addrinfo hint = {0}, *res;
 	char port_s[8];
+	char s[32];
 
 	sprintf(port_s, "%d", port);
 
@@ -58,28 +64,33 @@ connect_tcp(const char *host, int port) {
 	hint.ai_socktype = SOCK_STREAM;
 
 	if(getaddrinfo(host, port_s, &hint, &res) < 0) {
-		perror("getaddrinfo");
+		// perror("getaddrinfo");
 		return NULL;
 	}
 
 	if((sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) < 0) {
-		perror("socket");
+		// perror("socket");
 		return NULL;
 	}
 
-	if(connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-		return NULL;
-	}
+	if(connect(sock, res->ai_addr, res->ai_addrlen) < 0)
+		goto err;
 
 	t = malloc(sizeof(*t));
 	if(!t)
-		return NULL;
+		goto err;
 
 	t->fd = sock;
-	t->port = port;
-	printf("connection done: %d\n", port);
+	memcpy(&t->addr, res->ai_addr, res->ai_addrlen);
+
+	inet_ntop(AF_INET, &t->addr.sin_addr, s, 32);
+	printf("connection done: %s\n", s);
 
 	return t;
+
+err:
+	close(sock);
+	return NULL;
 }
 
 void
@@ -88,8 +99,9 @@ tcp_disconnected(TCP *t) {
 	tcp_free(t);
 }
 
+// IPv4 only
 int
-tcp_listen(int port) {
+tcp_listen(char *ipaddr, int port) {
 	int sock;
 	int yes = 1;
 	struct sockaddr_in sin;
@@ -101,22 +113,26 @@ tcp_listen(int port) {
 
 	sin.sin_family = AF_INET;
 	sin.sin_port = htons(port);
-	sin.sin_addr.s_addr = htonl(INADDR_ANY);
+	inet_pton(AF_INET, ipaddr, &sin.sin_addr);
 
 	if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
 		perror("setsockopt");
-		return -1;
+		goto err;
 	}
 	if(bind(sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
 		perror("bind");
-		return -1;
+		goto err;
 	}
 	if(listen(sock, 5) < 0) {
 		perror("listen");
-		return -1;
+		goto err;
 	}
 
 	return sock;
+
+err:
+	close(sock);
+	return -1;
 }
 
 ssize_t

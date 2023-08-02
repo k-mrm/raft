@@ -7,7 +7,14 @@
 #include <sys/timerfd.h>
 #include <assert.h>
 #include <poll.h>
+#include <arpa/inet.h>
 #include "tcp.h"
+
+char *iplist[3] = {
+	"10.0.0.100",
+	"10.0.0.1",
+	"10.0.0.2",
+};
 
 typedef enum RSTATE RSTATE;
 enum RSTATE {
@@ -22,6 +29,7 @@ struct RAFTPEER {
 	TCP *wrch;
 	TCP *rdch;
 
+	struct sockaddr_in addr;
 	int peerid;
 
 	bool active;
@@ -35,7 +43,7 @@ struct RAFTSERVER {
 	int htimeout_hi;
 
 	int socket;
-	int port;
+	char *ipaddr;
 
 	RAFTPEER peers[8];
 	int npeers;
@@ -99,6 +107,19 @@ peerbyid(RAFTSERVER *s, int peerid) {
 	for (int i = 0; i < s->npeers; i++) {
 		p = s->peers + i;
 		if (p->peerid == peerid)
+			return p;
+	}
+
+	return NULL;
+}
+
+struct RAFTPEER *
+peerbyip(RAFTSERVER *s, struct sockaddr_in addr) {
+	RAFTPEER *p;
+
+	for (int i = 0; i < s->npeers; i++) {
+		p = s->peers + i;
+		if (p->addr.sin_addr.s_addr == addr.sin_addr.s_addr)
 			return p;
 	}
 
@@ -201,7 +222,7 @@ tickinit(RAFTSERVER *s, void (*callback)(union sigval)) {
 }
 
 static void
-connectallserv(RAFTSERVER *s, int *servids, int nservs) {
+connectallserv(RAFTSERVER *s, int nservs) {
 	int peeridx = 0;
 	int i = 0;
 	RAFTPEER *peer;
@@ -217,46 +238,49 @@ connectallserv(RAFTSERVER *s, int *servids, int nservs) {
 
 		usleep(100 * 1000);	// wait 100 ms
 
-		if (servids[i] == s->myid) {
+		if (inet_addr(iplist[i]) == inet_addr(s->ipaddr)) {
 			connected |= 1 << i;
 			goto cnctd;
 		}
 
 		peer = &s->peers[peeridx];
-		ch = connect_tcp("0.0.0.0", servids[i]);
+		ch = connect_tcp(iplist[i], 1145);
 		if (ch) {
 			connected |= 1 << i;
 			peer->wrch = ch;
-			peer->peerid = servids[i];
+			peer->peerid = i;
+			peer->addr = ch->addr;
 			peer->active = true;
 			peeridx++;
 		}
 
-cnctd:
+	cnctd:
 		i = (i + 1) % nservs;
 	} while (connected != mask);
 }
 
 static void
-serverinit(RAFTSERVER *s, int me, int *servids, int nservs) {
+serverinit(RAFTSERVER *s, int myid, int nservs) {
 	int sock;
+	char *myip = iplist[myid];
+	int port = 1145;
 
 	s->state = NONESTATE;
 	s->htimeout_lo = 150;
 	s->htimeout_hi = 300;		// heartbeat timeout is 150-300 ms
 	s->heartbeat_tick = 50;		// heartbeat per 50 ms
 
-	sock = tcp_listen(me);	// establish tcp connection
+	sock = tcp_listen(myip, port);	// establish tcp connection
 	if (sock < 0) {
 		printf ("listen failed\n");
 		return;
 	}
-	printf("listen at %d...\n", me);
+	printf("listen at %s:%d...\n", myip, port);
 	s->socket = sock;
-	s->port = me;
-	s->myid = me;
+	s->myid = myid;
+	s->ipaddr = myip;
 
-	connectallserv(s, servids, nservs);
+	connectallserv(s, nservs);
 
 	tickinit(s, heartbeat);
 
@@ -311,8 +335,7 @@ servermain(RAFTSERVER *s) {
 			if (!rdch)
 				return -1;
 
-			// peerid == port number
-			peer = peerbyid(s, rdch->port);
+			peer = peerbyip(s, rdch->addr);
 			if (!peer) {
 				printf("no peer!\n");
 				return -1;
@@ -335,41 +358,19 @@ raft_leader(RAFTSERVER *s) {
 	return NULL;
 }
 
-static int
-serveridinit(char **servs, int nservs, int *servids) {
-	int id;
-
-	for (int i = 0; i < nservs; i++) {
-		id = atoi(servs[i]);
-		if (!id)
-			return -1;
-		servids[i] = id;
-	}
-
-	return 0;
-}
-
-/* servid == port number */
 int
 main(int argc, char *argv[]) {
 	RAFTSERVER server;
 	int ids[8];
-	int rc, me, nsids;
-	char **servs;
+	int rc, me;
+	int n = 3;
 
-	if (argc < 3)
+	if (argc < 2)
 		return -1;
 	me = atoi(argv[1]);
-	if (!me)
-		return -1;
 
-	// ./raft 1 1145 1919 931
-	nsids = argc - 2;
-	servs = argv + 2;
-
-	if (serveridinit(servs, nsids, ids) < 0)
-		return -1;
-	serverinit(&server, ids[me - 1], ids, nsids);
+	// ./raft 1 
+	serverinit(&server, me, n);
 	
 	for (;;) {
 		rc = servermain(&server);
