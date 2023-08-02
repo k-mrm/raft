@@ -6,7 +6,7 @@ struct tcpchnl {
 };
 
 struct tcpchnl *tcp_accept(int listenfd);
-struct tcpchnl *connect_tcp(const char *host, const char *port);
+struct tcpchnl *connect_tcp(const char *host, int port);
 void tcp_disconnected(struct tcpchnl *t);
 int tcp_listen(int port);
 ssize_t tcp_write(struct tcpchnl *t, unsigned char *buf, size_t n);

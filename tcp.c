@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
 #include <linux/if_packet.h>
+#include "tcp.h"
 
 struct tcpchnl *
 tcp_accept(int listenfd) {
@@ -44,15 +45,18 @@ tcp_free(struct tcpchnl *t) {
 }
 
 struct tcpchnl *
-connect_tcp(const char *host, const char *port) {
+connect_tcp(const char *host, int port) {
 	int sock;
 	struct tcpchnl *t;
 	struct addrinfo hint = {0}, *res;
+	char port_s[8];
+
+	sprintf(port_s, "%d", port);
 
 	hint.ai_family = PF_INET;
 	hint.ai_socktype = SOCK_STREAM;
 
-	if(getaddrinfo(host, port, &hint, &res) < 0) {
+	if(getaddrinfo(host, port_s, &hint, &res) < 0) {
 		perror("getaddrinfo");
 		return NULL;
 	}
@@ -63,7 +67,6 @@ connect_tcp(const char *host, const char *port) {
 	}
 
 	if(connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-		perror("connect");
 		return NULL;
 	}
 
@@ -72,14 +75,14 @@ connect_tcp(const char *host, const char *port) {
 		return NULL;
 
 	t->fd = sock;
-	printf("tunnel connection done\n");
+	printf("connection done: %d\n", port);
 
 	return t;
 }
 
 void
 tcp_disconnected(struct tcpchnl *t) {
-	printf("tunnel disconnected\n");
+	printf("disconnected\n");
 	tcp_free(t);
 }
 
