@@ -15,9 +15,9 @@
 #include <linux/if_packet.h>
 #include "tcp.h"
 
-struct tcpchnl *
+TCP *
 tcp_accept(int listenfd) {
-	struct tcpchnl *t;
+	TCP *t;
 	int clientfd;
 	struct sockaddr_in client_sin;
 	socklen_t sin_len = sizeof(client_sin);
@@ -40,14 +40,14 @@ tcp_accept(int listenfd) {
 }
 
 static void
-tcp_free(struct tcpchnl *t) {
+tcp_free(TCP *t) {
 	free(t);
 }
 
-struct tcpchnl *
+TCP *
 connect_tcp(const char *host, int port) {
 	int sock;
-	struct tcpchnl *t;
+	TCP *t;
 	struct addrinfo hint = {0}, *res;
 	char port_s[8];
 
@@ -81,7 +81,7 @@ connect_tcp(const char *host, int port) {
 }
 
 void
-tcp_disconnected(struct tcpchnl *t) {
+tcp_disconnected(TCP *t) {
 	printf("disconnected\n");
 	tcp_free(t);
 }
@@ -118,11 +118,11 @@ tcp_listen(int port) {
 }
 
 ssize_t
-tcp_write(struct tcpchnl *t, unsigned char *buf, size_t n) {
+tcp_write(TCP *t, unsigned char *buf, size_t n) {
 	return write(t->fd, buf, n);
 }
 
 ssize_t
-tcp_read(struct tcpchnl *t, unsigned char *buf, size_t n) {
+tcp_read(TCP *t, unsigned char *buf, size_t n) {
 	return read(t->fd, buf, n);
 }

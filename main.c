@@ -8,23 +8,26 @@
 #include <poll.h>
 #include "tcp.h"
 
-enum state {
+typedef enum RSTATE RSTATE;
+enum RSTATE {
 	NONESTATE,
 	FOLLOWER,
 	CANDIDATE,
 	LEADER,
 };
 
-struct raftpeer {
-	struct tcpchnl *ch;
+typedef struct RAFTPEER RAFTPEER;
+struct RAFTPEER {
+	TCP *ch;
 
 	int peerid;
 
 	bool active;
 };
 
-struct raftserver {
-	enum state state;
+typedef struct RAFTSERVER RAFTSERVER;
+struct RAFTSERVER {
+	RSTATE state;
 
 	int htimeout_lo;
 	int htimeout_hi;
@@ -32,7 +35,7 @@ struct raftserver {
 	int socket;
 	int port;
 
-	struct raftpeer peers[8];
+	RAFTPEER peers[8];
 	int npeers;
 
 	int myid;	
@@ -45,30 +48,35 @@ struct raftserver {
 	int votes;
 };
 
-enum rpctype {
+typedef enum RPCTYPE RPCTYPE;
+enum RPCTYPE {
 	REQUEST_VOTE,
 	APPEND_ENTRIES,
 };
 
-struct rpc {
-	enum rpctype type;
+typedef struct RPC RPC;
+struct RPC {
+	RPCTYPE type;
 	int term;
 };
 
-struct request_vote_rpc {
-	struct rpc rpc;
+typedef struct REQUEST_VOTE REQUEST_VOTE_RPC;
+struct REQUEST_VOTE_RPC {
+	RPC rpc;
 	int candidate_id;
 	int last_logindex;
 	int last_logterm;
 };
 
-struct request_vote_rep_rpc {
-	struct rpc rpc;
+typedef struct REQUEST_VOTE_REP_RPC REQUEST_VOTE_REP_RPC;
+struct REQUEST_VOTE_REP_RPC {
+	RPC rpc;
 	bool vote_granted;
 };
 
-struct append_entries_rpc {
-	struct rpc rpc;
+typedef struct APPEND_ENTRIES_RPC APPEND_ENTRIES_RPC;
+struct APPEND_ENTRIES_RPC {
+	RPC rpc;
 	int leaderid;
 	int prev_logindex;
 	int prev_logterm;
@@ -76,14 +84,15 @@ struct append_entries_rpc {
 	int leader_commit;
 } __attribute__((packed));
 
-struct append_entries_rep_rpc {
-	struct rpc rpc;
+typedef struct APPEND_ENTRIES_REP_RPC APPEND_ENTRIES_REP_RPC;
+struct APPEND_ENTRIES_REP_RPC {
+	RPC rpc;
 	bool success;
 } __attribute__((packed));
 
-static struct raftpeer *
-peerbyid(struct raftserver *s, int peerid) {
-	struct raftpeer *p = NULL;
+static RAFTPEER *
+peerbyid(RAFTSERVER *s, int peerid) {
+	RAFTPEER *p = NULL;
 
 	for (int i = 0; i < s->npeers; i++) {
 		p = s->peers + i;
@@ -94,18 +103,18 @@ peerbyid(struct raftserver *s, int peerid) {
 }
 
 static void
-sendrpc(struct raftserver *s, struct rpc *rpc) {
+sendrpc(RAFTSERVER *s, RPC *rpc) {
 	;
 }
 
 static void
-recvrpc(struct raftserver *s, struct rpc *rpc) {
+recvrpc(RAFTSERVER *s, RPC *rpc) {
 	;
 }
 
 static void
-send_heartbeat(struct raftserver *s) {
-	struct rpc rpc;
+send_heartbeat(RAFTSERVER *s) {
+	RPC rpc;
 	rpc.type = APPEND_ENTRIES;
 
 	sendrpc(s, &rpc);
@@ -113,7 +122,7 @@ send_heartbeat(struct raftserver *s) {
 
 void
 heartbeat(union sigval sv) {
-	struct raftserver *s = sv.sival_ptr;
+	RAFTSERVER *s = sv.sival_ptr;
 
 	if (s->state == LEADER) {
 		send_heartbeat(s);
@@ -130,7 +139,7 @@ ms_to_timespec(int ms) {
 }
 
 static int
-heartbeat_timeout(struct raftserver *s) {
+heartbeat_timeout(RAFTSERVER *s) {
 	int high, low, range;
 
 	high = s->htimeout_hi;
@@ -144,7 +153,7 @@ heartbeat_timeout(struct raftserver *s) {
 }
 
 static void
-tickinit(struct raftserver *s, void (*callback)(union sigval)) {
+tickinit(RAFTSERVER *s, void (*callback)(union sigval)) {
 	struct sigevent se;
 	struct itimerspec ts;
 	timer_t timer;
@@ -170,11 +179,11 @@ tickinit(struct raftserver *s, void (*callback)(union sigval)) {
 }
 
 static void
-connectserv(struct raftserver *s, int *servids, int nservs) {
+connectallserv(RAFTSERVER *s, int *servids, int nservs) {
 	int peeridx = 0;
 	int i = 0;
-	struct raftpeer *peer;
-	struct tcpchnl *chnl;
+	RAFTPEER *peer;
+	TCP *chnl;
 	int mask = (1 << nservs) - 1;
 	int connected = 0;
 
@@ -206,7 +215,7 @@ cnctd:
 }
 
 static void
-serverinit(struct raftserver *s, int me, int *servids, int nservs) {
+serverinit(RAFTSERVER *s, int me, int *servids, int nservs) {
 	int sock;
 
 	s->state = NONESTATE;
@@ -224,7 +233,7 @@ serverinit(struct raftserver *s, int me, int *servids, int nservs) {
 	s->port = me;
 	s->myid = me;
 
-	connectserv(s, servids, nservs);
+	connectallserv(s, servids, nservs);
 
 	tickinit(s, heartbeat);
 
@@ -232,12 +241,12 @@ serverinit(struct raftserver *s, int me, int *servids, int nservs) {
 }
 
 static void
-raftlog(struct raftserver *s, const char *fmt, ...) {
+raftlog(RAFTSERVER *s, const char *fmt, ...) {
 	;
 }
 
 static int
-servermain(struct raftserver *s) {
+servermain(RAFTSERVER *s) {
 	int nready;
 	struct pollfd fds[16];
 	struct pollfd *pfd;
@@ -259,7 +268,7 @@ servermain(struct raftserver *s) {
 			continue;
 		
 		if (pfd->fd == s->socket) {
-			struct tcpchnl *peer = tcp_accept(s->socket);
+			TCP *peer = tcp_accept(s->socket);
 			if (!peer)
 				return -1;
 			printf("!! new node\n");
@@ -270,8 +279,8 @@ servermain(struct raftserver *s) {
 	return 0;
 }
 
-static struct raftnode *
-raft_leader(struct raftserver *s) {
+static RAFTPEER *
+raft_leader(RAFTSERVER *s) {
 	;
 }
 
@@ -292,7 +301,7 @@ serveridinit(char **servs, int nservs, int *servids) {
 /* servid == port number */
 int
 main(int argc, char *argv[]) {
-	struct raftserver server;
+	RAFTSERVER server;
 	int ids[8];
 	int rc, me, nsids;
 	char **servs;
