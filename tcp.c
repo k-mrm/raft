@@ -36,6 +36,7 @@ tcp_accept(int listenfd) {
 		return NULL;
 
 	t->fd = clientfd;
+	t->port = ntohs(client_sin.sin_port);
 	return t;
 }
 
@@ -75,6 +76,7 @@ connect_tcp(const char *host, int port) {
 		return NULL;
 
 	t->fd = sock;
+	t->port = port;
 	printf("connection done: %d\n", port);
 
 	return t;
@@ -118,11 +120,11 @@ tcp_listen(int port) {
 }
 
 ssize_t
-tcp_write(TCP *t, unsigned char *buf, size_t n) {
+tcp_write(TCP *t, void *buf, size_t n) {
 	return write(t->fd, buf, n);
 }
 
 ssize_t
-tcp_read(TCP *t, unsigned char *buf, size_t n) {
+tcp_read(TCP *t, void *buf, size_t n) {
 	return read(t->fd, buf, n);
 }

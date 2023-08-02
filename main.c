@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <sys/timerfd.h>
+#include <assert.h>
 #include <poll.h>
 #include "tcp.h"
 
@@ -18,7 +19,8 @@ enum RSTATE {
 
 typedef struct RAFTPEER RAFTPEER;
 struct RAFTPEER {
-	TCP *ch;
+	TCP *wrch;
+	TCP *rdch;
 
 	int peerid;
 
@@ -60,7 +62,7 @@ struct RPC {
 	int term;
 };
 
-typedef struct REQUEST_VOTE REQUEST_VOTE_RPC;
+typedef struct REQUEST_VOTE_RPC REQUEST_VOTE_RPC;
 struct REQUEST_VOTE_RPC {
 	RPC rpc;
 	int candidate_id;
@@ -92,32 +94,52 @@ struct APPEND_ENTRIES_REP_RPC {
 
 static RAFTPEER *
 peerbyid(RAFTSERVER *s, int peerid) {
-	RAFTPEER *p = NULL;
+	RAFTPEER *p;
 
 	for (int i = 0; i < s->npeers; i++) {
 		p = s->peers + i;
 		if (p->peerid == peerid)
-			break;
+			return p;
 	}
-	return p;
+
+	return NULL;
 }
 
 static void
-sendrpc(RAFTSERVER *s, RPC *rpc) {
-	;
+sendrpc(RAFTSERVER *s, RPC *rpc, size_t size, RAFTPEER *target) {
+	rpc->term = s->term;
+
+	tcp_write(target->wrch, rpc, size);
 }
 
 static void
 recvrpc(RAFTSERVER *s, RPC *rpc) {
-	;
+}
+
+static void
+requestVote(RAFTSERVER *s) {
+	REQUEST_VOTE_RPC rpc;
+	RAFTPEER *peer;
+
+	assert(s->state == CANDIDATE);
+	printf("request vote\n");
+
+	rpc.rpc.type = REQUEST_VOTE;
+	rpc.candidate_id = s->myid;
+	rpc.last_logindex = 0;
+	rpc.last_logterm = 0;
+
+	// broadcast
+	for (int i = 0; i < s->npeers; i++) {
+		peer = s->peers + i;
+		sendrpc(s, (RPC *)&rpc, sizeof rpc, peer);
+	}
 }
 
 static void
 send_heartbeat(RAFTSERVER *s) {
 	RPC rpc;
 	rpc.type = APPEND_ENTRIES;
-
-	sendrpc(s, &rpc);
 }
 
 void
@@ -183,7 +205,7 @@ connectallserv(RAFTSERVER *s, int *servids, int nservs) {
 	int peeridx = 0;
 	int i = 0;
 	RAFTPEER *peer;
-	TCP *chnl;
+	TCP *ch;
 	int mask = (1 << nservs) - 1;
 	int connected = 0;
 
@@ -193,7 +215,7 @@ connectallserv(RAFTSERVER *s, int *servids, int nservs) {
 		if (connected & (1 << i))
 			goto cnctd;
 
-		usleep(100 * 1000);	// wait 100ms
+		usleep(100 * 1000);	// wait 100 ms
 
 		if (servids[i] == s->myid) {
 			connected |= 1 << i;
@@ -201,12 +223,13 @@ connectallserv(RAFTSERVER *s, int *servids, int nservs) {
 		}
 
 		peer = &s->peers[peeridx];
-		chnl = connect_tcp("0.0.0.0", servids[i]);
-		if (chnl) {
+		ch = connect_tcp("0.0.0.0", servids[i]);
+		if (ch) {
 			connected |= 1 << i;
-			peer->ch = chnl;
+			peer->wrch = ch;
 			peer->peerid = servids[i];
 			peer->active = true;
+			peeridx++;
 		}
 
 cnctd:
@@ -237,6 +260,8 @@ serverinit(RAFTSERVER *s, int me, int *servids, int nservs) {
 
 	tickinit(s, heartbeat);
 
+	s->state = FOLLOWER;
+
 	printf("serverinitdone\n");
 }
 
@@ -245,11 +270,25 @@ raftlog(RAFTSERVER *s, const char *fmt, ...) {
 	;
 }
 
+static void
+do_heartbeat_timeout(RAFTSERVER *s) {
+	if (s->state != FOLLOWER)
+		return;
+
+	printf("timeout: follower -> candidate\n");
+	s->state = CANDIDATE;
+	s->term++;
+
+	requestVote(s);
+}
+
 static int
 servermain(RAFTSERVER *s) {
 	int nready;
 	struct pollfd fds[16];
 	struct pollfd *pfd;
+	RAFTPEER *peer;
+	TCP *rdch;
 	int nfds;
 	int timeout = heartbeat_timeout(s);
 
@@ -258,7 +297,7 @@ servermain(RAFTSERVER *s) {
 
 	nready = poll(fds, nfds, timeout);
 	if (!nready) {
-		// printf("timeout\n");
+		do_heartbeat_timeout(s);
 		return 0;
 	}
 
@@ -268,11 +307,22 @@ servermain(RAFTSERVER *s) {
 			continue;
 		
 		if (pfd->fd == s->socket) {
-			TCP *peer = tcp_accept(s->socket);
-			if (!peer)
+			rdch = tcp_accept(s->socket);
+			if (!rdch)
 				return -1;
-			printf("!! new node\n");
+
+			// peerid == port number
+			peer = peerbyid(s, rdch->port);
+			if (!peer) {
+				printf("no peer!\n");
+				return -1;
+			}
+			peer->rdch = rdch;
+			printf("new peer!: %d\n", peer->peerid);
+		} else {
+			printf("message from other!\n");
 		}
+
 		nready--;
 	}
 
@@ -281,7 +331,8 @@ servermain(RAFTSERVER *s) {
 
 static RAFTPEER *
 raft_leader(RAFTSERVER *s) {
-	;
+	// TODO
+	return NULL;
 }
 
 static int
