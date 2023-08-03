@@ -47,6 +47,7 @@ tcp_accept(int listenfd) {
 
 static void
 tcp_free(TCP *t) {
+	close(t->fd);
 	free(t);
 }
 
@@ -67,12 +68,10 @@ connect_tcp(const char *host, int port) {
 		// perror("getaddrinfo");
 		return NULL;
 	}
-
 	if((sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) < 0) {
 		// perror("socket");
 		return NULL;
 	}
-
 	if(connect(sock, res->ai_addr, res->ai_addrlen) < 0)
 		goto err;
 
@@ -95,7 +94,10 @@ err:
 
 void
 tcp_disconnected(TCP *t) {
-	printf("disconnected\n");
+	char s[32];
+
+	inet_ntop(AF_INET, &t->addr.sin_addr, s, 32);
+	printf("disconnected @%s\n", s);
 	tcp_free(t);
 }
 

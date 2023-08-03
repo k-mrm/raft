@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <stdbool.h>
 #include <signal.h>
@@ -56,12 +57,15 @@ struct RAFTSERVER {
 	int term;
 
 	int votes;
+	bool voted;	// already voted?
 };
 
 typedef enum RPCTYPE RPCTYPE;
 enum RPCTYPE {
 	REQUEST_VOTE,
+	REQUEST_VOTE_REPLY,
 	APPEND_ENTRIES,
+	APPEND_ENTRIES_REPLY,
 };
 
 typedef struct RPC RPC;
@@ -92,13 +96,13 @@ struct APPEND_ENTRIES_RPC {
 	int prev_logterm;
 	char entries[32];
 	int leader_commit;
-} __attribute__((packed));
+};
 
 typedef struct APPEND_ENTRIES_REP_RPC APPEND_ENTRIES_REP_RPC;
 struct APPEND_ENTRIES_REP_RPC {
 	RPC rpc;
 	bool success;
-} __attribute__((packed));
+};
 
 static RAFTPEER *
 peerbyid(RAFTSERVER *s, int peerid) {
@@ -133,14 +137,123 @@ sendrpc(RAFTSERVER *s, RPC *rpc, size_t size, RAFTPEER *target) {
 	tcp_write(target->wrch, rpc, size);
 }
 
+static size_t
+readrpc(RAFTPEER *from, RPC *rpc, size_t bufsize) {
+	TCP *rd = from->rdch;
+
+	return tcp_read(rd, rpc, bufsize);
+}
+
 static void
-recvrpc(RAFTSERVER *s, RPC *rpc) {
+peerDisconnected(RAFTPEER *peer) {
+	tcp_disconnected(peer->wrch);
+	tcp_disconnected(peer->rdch);
+	peer->wrch = NULL;
+	peer->rdch = NULL;
+	peer->active = false;
+}
+
+static bool
+validRequest(REQUEST_VOTE_RPC *rpc) {
+	// TODO
+	return true;
+}
+
+static void
+recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
+	REQUEST_VOTE_REP_RPC reply;
+	bool vote = false;
+
+	printf("recv requestvote!\n");
+
+	reply.rpc.type = REQUEST_VOTE_REPLY;
+	if (s->state != LEADER && !s->voted && validRequest(rpc)) {
+		s->voted = true;
+		vote = true;	
+	}
+
+	reply.vote_granted = vote;
+
+	sendrpc(s, (RPC *)&reply, sizeof reply, from);
+}
+
+static bool
+isMajority(RAFTSERVER *s) {
+	int n = s->npeers + 1;	// peers + me
+	int major = n / 2 + 1;
+
+	return s->votes >= major;
+}
+
+static void
+recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
+	printf("recv requestvote reply!\n");
+
+	if (rpc->vote_granted) {
+		printf("voted from %d\n", from->peerid);
+		s->votes++;
+	}
+
+	if (isMajority(s)) {
+		printf("won vote! become a leader\n");
+		s->state = LEADER;
+	}
+}
+
+static void
+recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
+	// printf("recv append entries!\n");
+}
+
+static void
+recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc) {
+	printf("recv append entries reply!\n");
+}
+
+static void
+recvrpc(RAFTSERVER *s, RAFTPEER *from) {
+	char buf[512];
+	RPC *rpc = (RPC *)buf;
+	size_t rpcsize;
+
+	rpcsize = readrpc(from, rpc, 512);
+	if (rpcsize == 0)
+		peerDisconnected(from);
+
+	printf("message from other! from %d\n", from->peerid);
+
+	switch (rpc->type) {
+	case REQUEST_VOTE:
+		recvRequestVote(s, from, (REQUEST_VOTE_RPC *)rpc);
+		break;
+	case REQUEST_VOTE_REPLY:
+		recvRequestVoteRep(s, from, (REQUEST_VOTE_REP_RPC *)rpc);
+		break;
+	case APPEND_ENTRIES:
+		recvAppendEntries(s, from, (APPEND_ENTRIES_RPC *)rpc);
+		break;
+	case APPEND_ENTRIES_REPLY:
+		recvAppendEntriesRep(s, from, (APPEND_ENTRIES_REP_RPC *)rpc);
+		break;
+	default:
+		printf("???????\n");
+		return;
+	}
+}
+
+static void
+rpcbcast(RAFTSERVER *s, RPC *rpc, size_t size) {
+	RAFTPEER *peer;
+
+	for (int i = 0; i < s->npeers; i++) {
+		peer = s->peers + i;
+		sendrpc(s, rpc, size, peer);
+	}
 }
 
 static void
 requestVote(RAFTSERVER *s) {
 	REQUEST_VOTE_RPC rpc;
-	RAFTPEER *peer;
 
 	assert(s->state == CANDIDATE);
 	printf("request vote\n");
@@ -150,17 +263,16 @@ requestVote(RAFTSERVER *s) {
 	rpc.last_logindex = 0;
 	rpc.last_logterm = 0;
 
-	// broadcast
-	for (int i = 0; i < s->npeers; i++) {
-		peer = s->peers + i;
-		sendrpc(s, (RPC *)&rpc, sizeof rpc, peer);
-	}
+	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
 }
 
 static void
 send_heartbeat(RAFTSERVER *s) {
-	RPC rpc;
-	rpc.type = APPEND_ENTRIES;
+	APPEND_ENTRIES_RPC rpc;
+
+	rpc.rpc.type = APPEND_ENTRIES;
+
+	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
 }
 
 void
@@ -265,10 +377,12 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 	char *myip = iplist[myid];
 	int port = 1145;
 
+	memset(s, 0, sizeof *s);
 	s->state = NONESTATE;
 	s->htimeout_lo = 150;
 	s->htimeout_hi = 300;		// heartbeat timeout is 150-300 ms
 	s->heartbeat_tick = 50;		// heartbeat per 50 ms
+	s->npeers = 0;
 
 	sock = tcp_listen(myip, port);	// establish tcp connection
 	if (sock < 0) {
@@ -295,6 +409,14 @@ raftlog(RAFTSERVER *s, const char *fmt, ...) {
 }
 
 static void
+startVote(RAFTSERVER *s) {
+	// vote me
+	s->votes++;
+
+	requestVote(s);
+}
+
+static void
 do_heartbeat_timeout(RAFTSERVER *s) {
 	if (s->state != FOLLOWER)
 		return;
@@ -303,23 +425,50 @@ do_heartbeat_timeout(RAFTSERVER *s) {
 	s->state = CANDIDATE;
 	s->term++;
 
-	requestVote(s);
+	startVote(s);
+}
+
+static int
+raftpollfd(RAFTSERVER *s, struct pollfd *fds, RAFTPEER **peers) {
+	int nfds;
+	RAFTPEER *peer;
+	TCP *rdch;
+	int pi = 0;
+
+	fds[0] = (struct pollfd){ .fd = s->socket, .events = POLLIN };
+	nfds = 1;
+
+	for (peer = s->peers; peer < &s->peers[s->npeers]; peer++) {
+		if (!peer->active)
+			continue;
+		
+		rdch = peer->rdch;
+		if (!rdch)
+			continue;
+
+		fds[nfds++] = (struct pollfd){ .fd = rdch->fd, .events = POLLIN };		
+		peers[pi++] = peer;
+	}
+
+	return nfds;
 }
 
 static int
 servermain(RAFTSERVER *s) {
 	int nready;
 	struct pollfd fds[16];
+	RAFTPEER *peers[16];
 	struct pollfd *pfd;
 	RAFTPEER *peer;
 	TCP *rdch;
 	int nfds;
 	int timeout = heartbeat_timeout(s);
 
-	fds[0] = (struct pollfd){ .fd = s->socket, .events = POLLIN };
-	nfds = 1;
+	nfds = raftpollfd(s, fds, peers);
 
 	nready = poll(fds, nfds, timeout);
+	if (nready < 0)
+		return -1;
 	if (!nready) {
 		do_heartbeat_timeout(s);
 		return 0;
@@ -343,7 +492,9 @@ servermain(RAFTSERVER *s) {
 			peer->rdch = rdch;
 			printf("new peer!: %d\n", peer->peerid);
 		} else {
-			printf("message from other!\n");
+			RAFTPEER *peer = peers[i - 1];
+
+			recvrpc(s, peer);
 		}
 
 		nready--;
@@ -361,7 +512,6 @@ raft_leader(RAFTSERVER *s) {
 int
 main(int argc, char *argv[]) {
 	RAFTSERVER server;
-	int ids[8];
 	int rc, me;
 	int n = 3;
 

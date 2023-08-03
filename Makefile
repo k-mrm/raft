@@ -1,7 +1,7 @@
 CC = gcc
 LD = ld
 
-CFLAGS += -Wall -Wextra -I ./ -Og
+CFLAGS += -Wall -Wextra -I ./ -Og -g
 
 TARGET = raft
 OBJS = main.o tcp.o
