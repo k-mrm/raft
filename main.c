@@ -58,6 +58,8 @@ struct RAFTSERVER {
 
 	int votes;
 	bool voted;	// already voted?
+
+	RAFTPEER *leader;
 };
 
 typedef enum RPCTYPE RPCTYPE;
@@ -77,25 +79,25 @@ struct RPC {
 typedef struct REQUEST_VOTE_RPC REQUEST_VOTE_RPC;
 struct REQUEST_VOTE_RPC {
 	RPC rpc;
-	int candidate_id;
-	int last_logindex;
-	int last_logterm;
+	int candidateId;
+	int lastLogindex;
+	int lastLogterm;
 };
 
 typedef struct REQUEST_VOTE_REP_RPC REQUEST_VOTE_REP_RPC;
 struct REQUEST_VOTE_REP_RPC {
 	RPC rpc;
-	bool vote_granted;
+	bool voteGranted;
 };
 
 typedef struct APPEND_ENTRIES_RPC APPEND_ENTRIES_RPC;
 struct APPEND_ENTRIES_RPC {
 	RPC rpc;
-	int leaderid;
-	int prev_logindex;
-	int prev_logterm;
+	int leaderId;
+	int prevLogindex;
+	int prevLogterm;
 	char entries[32];
-	int leader_commit;
+	int leaderCommit;
 };
 
 typedef struct APPEND_ENTRIES_REP_RPC APPEND_ENTRIES_REP_RPC;
@@ -103,6 +105,11 @@ struct APPEND_ENTRIES_REP_RPC {
 	RPC rpc;
 	bool success;
 };
+
+static void
+bzero(void *buf, size_t s) {
+	memset(buf, 0, s);
+}
 
 static RAFTPEER *
 peerbyid(RAFTSERVER *s, int peerid) {
@@ -172,7 +179,7 @@ recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 		vote = true;	
 	}
 
-	reply.vote_granted = vote;
+	reply.voteGranted = vote;
 
 	sendrpc(s, (RPC *)&reply, sizeof reply, from);
 }
@@ -186,10 +193,16 @@ isMajority(RAFTSERVER *s) {
 }
 
 static void
+voteDone(RAFTSERVER *s) {
+	s->votes = 0;
+	s->voted = false;
+}
+
+static void
 recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
 	printf("recv requestvote reply!\n");
 
-	if (rpc->vote_granted) {
+	if (rpc->voteGranted) {
 		printf("voted from %d\n", from->peerid);
 		s->votes++;
 	}
@@ -197,12 +210,54 @@ recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
 	if (isMajority(s)) {
 		printf("won vote! become a leader\n");
 		s->state = LEADER;
+		voteDone(s);
 	}
+}
+
+static bool
+biszero(void *buf, size_t size) {
+	char zero[size];
+
+	memset(zero, 0, size);
+	return !memcmp(buf, zero, size);
+}   
+
+static bool
+validCurterm(RAFTSERVER *s, APPEND_ENTRIES_RPC *rpc) {
+	// TODO
+	return true;
+}
+
+static void
+recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
+	if (s->state == LEADER)
+		return;
+
+	printf("heartbeat %d\n", s->state);
+	if (s->state == CANDIDATE) {
+		if (!validCurterm(s, rpc))
+			return;
+
+		// other peer became LEADER, vote is end
+		printf("now leader is %d!!!!!!!!!!\n", from->peerid);
+		s->state = FOLLOWER;
+		voteDone(s);
+	}
+
+	s->leader = from;
 }
 
 static void
 recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	// printf("recv append entries!\n");
+	
+	// null entries is heartbeat
+	if (biszero(rpc->entries, sizeof rpc->entries)) {
+		recvHeartbeat(s, from, rpc);
+		return;
+	}
+
+	printf("entries: \n");
 }
 
 static void
@@ -259,18 +314,26 @@ requestVote(RAFTSERVER *s) {
 	printf("request vote\n");
 
 	rpc.rpc.type = REQUEST_VOTE;
-	rpc.candidate_id = s->myid;
-	rpc.last_logindex = 0;
-	rpc.last_logterm = 0;
+	rpc.candidateId = s->myid;
+	rpc.lastLogindex = 0;
+	rpc.lastLogterm = 0;
 
 	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
 }
 
 static void
-send_heartbeat(RAFTSERVER *s) {
+sendHeartbeat(RAFTSERVER *s) {
 	APPEND_ENTRIES_RPC rpc;
 
+	if (s->state != LEADER)
+		return;
+
 	rpc.rpc.type = APPEND_ENTRIES;
+	rpc.leaderId = s->myid;
+	rpc.prevLogindex = 0;
+	rpc.prevLogterm = 0;
+	bzero(rpc.entries, sizeof rpc.entries);
+	rpc.leaderCommit = 0;	// TODO
 
 	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
 }
@@ -279,14 +342,11 @@ void
 heartbeat(union sigval sv) {
 	RAFTSERVER *s = sv.sival_ptr;
 
-	if (s->state == LEADER) {
-		send_heartbeat(s);
-	}
-	// printf ("heartbeat!\n");
+	sendHeartbeat(s);
 }
 
 static struct timespec
-ms_to_timespec(int ms) {
+ms2timespec(int ms) {
 	struct timespec ts;
 	ts.tv_sec = ms / 1000;	
 	ts.tv_nsec = (ms % 1000) * 1000000;
@@ -294,7 +354,7 @@ ms_to_timespec(int ms) {
 }
 
 static int
-heartbeat_timeout(RAFTSERVER *s) {
+heartbeatTimeout(RAFTSERVER *s) {
 	int high, low, range;
 
 	high = s->htimeout_hi;
@@ -318,8 +378,8 @@ tickinit(RAFTSERVER *s, void (*callback)(union sigval)) {
 	se.sigev_notify_function = callback;
 	se.sigev_notify_attributes = NULL;
 
-	ts.it_value = ms_to_timespec(s->heartbeat_tick);
-	ts.it_interval = ms_to_timespec(s->heartbeat_tick);
+	ts.it_value = ms2timespec(s->heartbeat_tick);
+	ts.it_interval = ms2timespec(s->heartbeat_tick);
 
 	if (timer_create(CLOCK_MONOTONIC, &se, &timer) < 0) {
 		printf("timer_create!");
@@ -377,7 +437,7 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 	char *myip = iplist[myid];
 	int port = 1145;
 
-	memset(s, 0, sizeof *s);
+	bzero(s, sizeof *s);
 	s->state = NONESTATE;
 	s->htimeout_lo = 150;
 	s->htimeout_hi = 300;		// heartbeat timeout is 150-300 ms
@@ -409,7 +469,8 @@ raftlog(RAFTSERVER *s, const char *fmt, ...) {
 }
 
 static void
-startVote(RAFTSERVER *s) {
+election(RAFTSERVER *s) {
+	s->term++;
 	// vote me
 	s->votes++;
 
@@ -417,15 +478,17 @@ startVote(RAFTSERVER *s) {
 }
 
 static void
-do_heartbeat_timeout(RAFTSERVER *s) {
-	if (s->state != FOLLOWER)
+doHeartbeatTimeout(RAFTSERVER *s) {
+	if (s->state == LEADER)
 		return;
 
-	printf("timeout: follower -> candidate\n");
-	s->state = CANDIDATE;
-	s->term++;
+	printf("timeout, start election\n");
 
-	startVote(s);
+	if (s->state == CANDIDATE)	// re-election
+		voteDone(s);
+
+	s->state = CANDIDATE;
+	election(s);
 }
 
 static int
@@ -462,7 +525,7 @@ servermain(RAFTSERVER *s) {
 	RAFTPEER *peer;
 	TCP *rdch;
 	int nfds;
-	int timeout = heartbeat_timeout(s);
+	int timeout = heartbeatTimeout(s);
 
 	nfds = raftpollfd(s, fds, peers);
 
@@ -470,7 +533,7 @@ servermain(RAFTSERVER *s) {
 	if (nready < 0)
 		return -1;
 	if (!nready) {
-		do_heartbeat_timeout(s);
+		doHeartbeatTimeout(s);
 		return 0;
 	}
 
@@ -501,12 +564,6 @@ servermain(RAFTSERVER *s) {
 	}
 
 	return 0;
-}
-
-static RAFTPEER *
-raft_leader(RAFTSERVER *s) {
-	// TODO
-	return NULL;
 }
 
 int
