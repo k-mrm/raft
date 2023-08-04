@@ -36,6 +36,11 @@ struct RAFTPEER {
 	bool active;
 };
 
+#define foreachPeer(s, p)		\
+		int _np = (s)->npeers;	\
+		for (p = (s)->peers; (p) < &(s)->peers[8] && _np; (p)++)	\
+			if ((p)->active && _np--)
+
 typedef struct RAFTSERVER RAFTSERVER;
 struct RAFTSERVER {
 	RSTATE state;
@@ -54,7 +59,7 @@ struct RAFTSERVER {
 	timer_t timer;
 	int heartbeat_tick;
 
-	int term;
+	int curterm;
 
 	int votes;
 	bool voted;	// already voted?
@@ -64,6 +69,7 @@ struct RAFTSERVER {
 
 typedef enum RPCTYPE RPCTYPE;
 enum RPCTYPE {
+	NONRPCTYPE,
 	REQUEST_VOTE,
 	REQUEST_VOTE_REPLY,
 	APPEND_ENTRIES,
@@ -115,8 +121,7 @@ static RAFTPEER *
 peerbyid(RAFTSERVER *s, int peerid) {
 	RAFTPEER *p;
 
-	for (int i = 0; i < s->npeers; i++) {
-		p = s->peers + i;
+	foreachPeer(s, p) {
 		if (p->peerid == peerid)
 			return p;
 	}
@@ -128,8 +133,7 @@ struct RAFTPEER *
 peerbyip(RAFTSERVER *s, struct sockaddr_in addr) {
 	RAFTPEER *p;
 
-	for (int i = 0; i < s->npeers; i++) {
-		p = s->peers + i;
+	foreachPeer(s, p) {
 		if (p->addr.sin_addr.s_addr == addr.sin_addr.s_addr)
 			return p;
 	}
@@ -139,7 +143,7 @@ peerbyip(RAFTSERVER *s, struct sockaddr_in addr) {
 
 static void
 sendrpc(RAFTSERVER *s, RPC *rpc, size_t size, RAFTPEER *target) {
-	rpc->term = s->term;
+	rpc->term = s->curterm;
 
 	tcp_write(target->wrch, rpc, size);
 }
@@ -152,12 +156,14 @@ readrpc(RAFTPEER *from, RPC *rpc, size_t bufsize) {
 }
 
 static void
-peerDisconnected(RAFTPEER *peer) {
+peerDisconnected(RAFTSERVER *s, RAFTPEER *peer) {
 	tcp_disconnected(peer->wrch);
 	tcp_disconnected(peer->rdch);
 	peer->wrch = NULL;
 	peer->rdch = NULL;
 	peer->active = false;
+
+	s->npeers--;
 }
 
 static bool
@@ -173,8 +179,13 @@ recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 
 	printf("recv requestvote!\n");
 
+	if (s->state == LEADER)
+		printf("????leader\n");
+
 	reply.rpc.type = REQUEST_VOTE_REPLY;
-	if (s->state != LEADER && !s->voted && validRequest(rpc)) {
+
+	// Is a candidate new?
+	if (!s->voted && ((RPC *)rpc)->term > s->curterm) {
 		s->voted = true;
 		vote = true;	
 	}
@@ -186,10 +197,7 @@ recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 
 static bool
 isMajority(RAFTSERVER *s) {
-	int n = s->npeers + 1;	// peers + me
-	int major = n / 2 + 1;
-
-	return s->votes >= major;
+	return s->votes * 2 > s->npeers + 1;
 }
 
 static void
@@ -222,24 +230,19 @@ biszero(void *buf, size_t size) {
 	return !memcmp(buf, zero, size);
 }   
 
-static bool
-validCurterm(RAFTSERVER *s, APPEND_ENTRIES_RPC *rpc) {
-	// TODO
-	return true;
-}
-
 static void
 recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
+	// TODO
 	if (s->state == LEADER)
+		printf("leader recv heartbeat\n");
+
+	// old heartbeat is denied
+	if (((RPC *)rpc)->term < s->curterm)
 		return;
 
-	printf("heartbeat %d\n", s->state);
 	if (s->state == CANDIDATE) {
-		if (!validCurterm(s, rpc))
-			return;
-
-		// other peer became LEADER, vote is end
-		printf("now leader is %d!!!!!!!!!!\n", from->peerid);
+		// other peer became LEADER, election is end
+		printf("Term%d: now leader is %d!!!!!!!!!!\n", s->curterm, from->peerid);
 		s->state = FOLLOWER;
 		voteDone(s);
 	}
@@ -251,8 +254,7 @@ static void
 recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	// printf("recv append entries!\n");
 	
-	// null entries is heartbeat
-	if (biszero(rpc->entries, sizeof rpc->entries)) {
+	if (biszero(rpc->entries, sizeof rpc->entries)) {	// is heartbeat?
 		recvHeartbeat(s, from, rpc);
 		return;
 	}
@@ -273,9 +275,7 @@ recvrpc(RAFTSERVER *s, RAFTPEER *from) {
 
 	rpcsize = readrpc(from, rpc, 512);
 	if (rpcsize == 0)
-		peerDisconnected(from);
-
-	printf("message from other! from %d\n", from->peerid);
+		peerDisconnected(s, from);
 
 	switch (rpc->type) {
 	case REQUEST_VOTE:
@@ -291,7 +291,6 @@ recvrpc(RAFTSERVER *s, RAFTPEER *from) {
 		recvAppendEntriesRep(s, from, (APPEND_ENTRIES_REP_RPC *)rpc);
 		break;
 	default:
-		printf("???????\n");
 		return;
 	}
 }
@@ -300,8 +299,7 @@ static void
 rpcbcast(RAFTSERVER *s, RPC *rpc, size_t size) {
 	RAFTPEER *peer;
 
-	for (int i = 0; i < s->npeers; i++) {
-		peer = s->peers + i;
+	foreachPeer(s, peer) {
 		sendrpc(s, rpc, size, peer);
 	}
 }
@@ -464,15 +462,12 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 }
 
 static void
-raftlog(RAFTSERVER *s, const char *fmt, ...) {
-	;
-}
-
-static void
 election(RAFTSERVER *s) {
-	s->term++;
 	// vote me
 	s->votes++;
+	s->voted = true;
+
+	s->curterm++;
 
 	requestVote(s);
 }
@@ -501,10 +496,7 @@ raftpollfd(RAFTSERVER *s, struct pollfd *fds, RAFTPEER **peers) {
 	fds[0] = (struct pollfd){ .fd = s->socket, .events = POLLIN };
 	nfds = 1;
 
-	for (peer = s->peers; peer < &s->peers[s->npeers]; peer++) {
-		if (!peer->active)
-			continue;
-		
+	foreachPeer(s, peer) {
 		rdch = peer->rdch;
 		if (!rdch)
 			continue;
@@ -553,10 +545,10 @@ servermain(RAFTSERVER *s) {
 				return -1;
 			}
 			peer->rdch = rdch;
+
 			printf("new peer!: %d\n", peer->peerid);
 		} else {
-			RAFTPEER *peer = peers[i - 1];
-
+			peer = peers[i - 1];
 			recvrpc(s, peer);
 		}
 
