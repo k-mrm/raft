@@ -232,6 +232,8 @@ biszero(void *buf, size_t size) {
 
 static void
 recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
+	RAFTPEER *prevleader = s->leader;
+
 	// TODO
 	if (s->state == LEADER)
 		printf("leader recv heartbeat\n");
@@ -248,6 +250,10 @@ recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	}
 
 	s->leader = from;
+	if (prevleader != s->leader) {
+		int pid = prevleader ? prevleader->peerid : -1;
+		printf("leader changed: %d -> %d\n", pid, s->leader->peerid);
+	}
 }
 
 static void
@@ -269,7 +275,7 @@ recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc)
 
 static void
 recvrpc(RAFTSERVER *s, RAFTPEER *from) {
-	char buf[512];
+	char buf[512] = {0};
 	RPC *rpc = (RPC *)buf;
 	size_t rpcsize;
 
@@ -479,8 +485,10 @@ doHeartbeatTimeout(RAFTSERVER *s) {
 
 	printf("timeout, start election\n");
 
-	if (s->state == CANDIDATE)	// re-election
+	if (s->state == CANDIDATE) {
+		printf("reelection\n");
 		voteDone(s);
+	}
 
 	s->state = CANDIDATE;
 	election(s);
