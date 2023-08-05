@@ -19,7 +19,7 @@ $ ./raft 0
 # in console 2
 $ sudo ip netns exec host1 bash
 $ ./raft 1
-# in console 2
+# in console 3
 $ sudo ip netns exec host2 bash
 $ ./raft 2
 ```
