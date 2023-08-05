@@ -23,6 +23,14 @@ enum RSTATE {
 	FOLLOWER,
 	CANDIDATE,
 	LEADER,
+	NSTATE,
+};
+
+static const char *st[NSTATE] = {
+	[NONESTATE] 	"NONE",
+	[FOLLOWER]	"FOLLOWER",
+	[CANDIDATE]	"CANDIDATE",
+	[LEADER]	"LEADER",
 };
 
 typedef struct RAFTPEER RAFTPEER;
@@ -112,6 +120,9 @@ struct APPEND_ENTRIES_REP_RPC {
 	bool success;
 };
 
+#define rlog(s, fmt, ...)	\
+	printf("R%d[%s] (Term%d): " fmt, (s)->myid, st[(s)->state], (s)->curterm, ##__VA_ARGS__)
+
 static void
 bzero(void *buf, size_t s) {
 	memset(buf, 0, s);
@@ -119,7 +130,7 @@ bzero(void *buf, size_t s) {
 
 static void
 setCurTerm(RAFTSERVER *s, int curterm) {
-	printf("update Term: %d->%d\n", s->curterm, curterm);
+	rlog(s, "update Term: -> %d\n", curterm);
 	s->curterm = curterm;
 }
 
@@ -178,12 +189,6 @@ peerDisconnected(RAFTSERVER *s, RAFTPEER *peer) {
 	s->npeers--;
 }
 
-static bool
-validRequest(REQUEST_VOTE_RPC *rpc) {
-	// TODO
-	return true;
-}
-
 static void
 recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 	REQUEST_VOTE_REP_RPC reply;
@@ -191,28 +196,28 @@ recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 	bool validvote = false;
 
 	reply.rpc.type = REQUEST_VOTE_REPLY;
-	printf("Term%d recv requestvote from: %d(T%d)\n", s->curterm, from->peerid, ((RPC *)rpc)->term);
+	rlog(s, "recv requestvote from: %d(T%d)\n", from->peerid, ((RPC *)rpc)->term);
 
 	// TODO
 	assert(s->state != LEADER);
 
 	if (((RPC *)rpc)->term >= s->curterm) {
-		printf("recv request vote from newer peer state:%d\n", s->state);
+		rlog(s, "recv request vote from newer peer\n");
 		if (s->state == FOLLOWER) {
 			validvote = true;
 		} else {	// candidate
+			s->state = FOLLOWER;
 			voteDone(s);
 		}
 		setCurTerm(s, ((RPC *)rpc)->term);
-		s->state = FOLLOWER;
 	}
 
 	if (!s->voted && validvote) {
 		s->voted = true;
 		vote = true;
-		printf("voted to %d\n", from->peerid);
+		rlog(s, "voted to %d\n", from->peerid);
 	} else {
-		printf("cannot vote to %d\n", from->peerid);
+		rlog(s, "cannot vote to %d\n", from->peerid);
 	}
 
 	reply.voteGranted = vote;
@@ -229,7 +234,7 @@ voteme(RAFTSERVER *s) {
 	s->votes++;
 
 	if (isMajority(s)) {
-		printf("won vote! become a leader\n");
+		rlog(s, "won vote! become a leader\n");
 		s->state = LEADER;
 		s->leader = NULL;	// leader is me
 		voteDone(s);
@@ -238,7 +243,7 @@ voteme(RAFTSERVER *s) {
 
 static void
 recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
-	printf("Term%d: recv requestvote reply! %d(T%d)\n", s->curterm, from->peerid, ((RPC *)rpc)->term);
+	rlog(s, "recv requestvote reply! %d(T%d)\n", from->peerid, ((RPC *)rpc)->term);
 
 	// rpc is too late
 	if (((RPC *)rpc)->term < s->curterm)
@@ -246,8 +251,8 @@ recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
 
 	// my raftserver is old
 	if (((RPC *)rpc)->term > s->curterm) {
-		printf("Term%d: vote from newer peer: %d Term:%d\n",
-		       s->curterm, from->peerid, ((RPC *)rpc)->term);
+		rlog(s, "vote from newer peer: %d Term:%d\n",
+		     from->peerid, ((RPC *)rpc)->term);
 		setCurTerm(s, ((RPC *)rpc)->term);
 		s->state = FOLLOWER;
 		voteDone(s);
@@ -255,7 +260,7 @@ recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
 	}
 
 	if (rpc->voteGranted) {
-		printf("voted from %d\n", from->peerid);
+		rlog(s, "voted from %d\n", from->peerid);
 		voteme(s);
 	}
 }
@@ -272,17 +277,13 @@ static void
 recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	RAFTPEER *prevleader = s->leader;
 
-	// TODO
-	if (s->state == LEADER)
-		printf("leader recv heartbeat\n");
-
 	// old heartbeat is denied
 	if (((RPC *)rpc)->term < s->curterm)
 		return;
 
-	if (s->state == CANDIDATE) {
-		// other peer became LEADER, election is end
-		printf("Term%d: now leader is %d!!!!!!!!!!\n", s->curterm, from->peerid);
+	if (s->state == CANDIDATE || s->state == LEADER) {
+		// other peer became LEADER
+		rlog(s, "now leader is %d!!!!!!!!!!\n", from->peerid);
 		s->state = FOLLOWER;
 		voteDone(s);
 	}
@@ -290,14 +291,12 @@ recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	s->leader = from;
 	if (prevleader != s->leader) {
 		int pid = prevleader ? prevleader->peerid : -1;
-		printf("leader changed: %d -> %d\n", pid, s->leader->peerid);
+		rlog(s, "leader changed: %d -> %d\n", pid, s->leader->peerid);
 	}
 }
 
 static void
 recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
-	// printf("recv append entries!\n");
-	
 	if (biszero(rpc->entries, sizeof rpc->entries)) {	// is heartbeat?
 		recvHeartbeat(s, from, rpc);
 		return;
@@ -354,7 +353,7 @@ requestVote(RAFTSERVER *s) {
 
 	if (s->state != CANDIDATE)
 		return;
-	printf("Term%d: request vote\n", s->curterm);
+	rlog(s, "request vote\n");
 
 	rpc.rpc.type = REQUEST_VOTE;
 	rpc.candidateId = s->myid;
@@ -512,7 +511,7 @@ static void
 election(RAFTSERVER *s) {
 	setCurTerm(s, s->curterm + 1);
 
-	printf("Term%d: voted to me!\n", s->curterm);
+	rlog(s, "voted to me!\n");
 
 	voteme(s);
 	s->voted = true;
@@ -526,7 +525,7 @@ doHeartbeatTimeout(RAFTSERVER *s) {
 		return;
 
 	if (s->state == CANDIDATE) {
-		printf("reelection\n");
+		rlog(s, "reelection\n");
 		voteDone(s);
 	}
 
@@ -573,7 +572,7 @@ servermain(RAFTSERVER *s) {
 	if (nready < 0)
 		return -1;
 	if (!nready) {
-		printf("timeout: %d ms\n", timeout);
+		rlog(s, "timeout: %d ms\n", timeout);
 		doHeartbeatTimeout(s);
 		return 0;
 	}
@@ -590,12 +589,12 @@ servermain(RAFTSERVER *s) {
 
 			peer = peerbyip(s, rdch->addr);
 			if (!peer) {
-				printf("no peer!\n");
+				rlog(s, "no peer!\n");
 				return -1;
 			}
 			peer->rdch = rdch;
 
-			printf("new peer!: %d\n", peer->peerid);
+			rlog(s, "new peer!: %d\n", peer->peerid);
 		} else {
 			peer = peers[i - 1];
 			recvrpc(s, peer);
