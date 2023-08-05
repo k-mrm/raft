@@ -326,8 +326,6 @@ static void
 recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	RAFTPEER *prevleader = s->leader;
 
-	printf("recv heartbeat!!!!!!!\n");
-
 	if (s->state == CANDIDATE || s->state == LEADER) {
 		// other peer became LEADER
 		rlog(s, "now leader is %d!!!!!!!!!!\n", from->peerid);
@@ -346,6 +344,15 @@ recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	for ((entry) = (log); (entry) < &(log)[(n)] && (entry)->term != 0; (entry)++)
 
 static void
+logDump(LOG *log, int n) {
+	LOG *entry;
+
+	foreachLog(entry, log, n) {
+		printf("log T%d %d %d\n", entry->term, entry->cmd.op, entry->cmd.arg);
+	}
+}
+
+static void
 recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	APPEND_ENTRIES_REP_RPC reply;
 	LOG *entry;
@@ -358,6 +365,8 @@ recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 		recvHeartbeat(s, from, rpc);
 		return;
 	}
+
+	logDump(rpc->entries, 32);
 
 	reply.rpc.type = APPEND_ENTRIES_REPLY;
 	reply.success = false;
@@ -388,11 +397,11 @@ recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc)
 
 static void
 recvrpc(RAFTSERVER *s, RAFTPEER *from) {
-	char buf[512] = {0};
+	char buf[1024] = {0};
 	RPC *rpc = (RPC *)buf;
 	size_t rpcsize;
 
-	rpcsize = readrpc(from, rpc, 512);
+	rpcsize = readrpc(from, rpc, 1024);
 	if (rpcsize == 0)
 		peerDisconnected(s, from);
 
@@ -464,7 +473,6 @@ appendEntries(RAFTSERVER *s, bool heartbeat) {
 	rpc.leaderCommit = s->commitIndex;
 
 	if (heartbeat) {
-		printf("send heartbeat\n");
 		bzero(rpc.entries, sizeof rpc.entries);
 	} else {
 		// FIXME

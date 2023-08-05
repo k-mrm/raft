@@ -4,12 +4,12 @@
 ## How to Use
 - make
 ```
-$ make
+$ make raft
 ```
 
 - prepare environment (require sudo)
 ```
-$ ./demons.sh
+$ sh demons.sh
 ```
 
 - execution (require sudo)
