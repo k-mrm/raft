@@ -37,9 +37,9 @@ struct RAFTPEER {
 };
 
 #define foreachPeer(s, p)		\
-		int _np = (s)->npeers;	\
-		for (p = (s)->peers; (p) < &(s)->peers[8] && _np; (p)++)	\
-			if ((p)->active && _np--)
+	int _np = (s)->npeers;		\
+	for (p = (s)->peers; (p) < &(s)->peers[8] && _np; (p)++)	\
+		if ((p)->active && _np--)
 
 typedef struct RAFTSERVER RAFTSERVER;
 struct RAFTSERVER {
@@ -117,6 +117,18 @@ bzero(void *buf, size_t s) {
 	memset(buf, 0, s);
 }
 
+static void
+setCurTerm(RAFTSERVER *s, int curterm) {
+	printf("update Term: %d->%d\n", s->curterm, curterm);
+	s->curterm = curterm;
+}
+
+static void
+voteDone(RAFTSERVER *s) {
+	s->votes = 0;
+	s->voted = false;
+}
+
 static RAFTPEER *
 peerbyid(RAFTSERVER *s, int peerid) {
 	RAFTPEER *p;
@@ -176,22 +188,34 @@ static void
 recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 	REQUEST_VOTE_REP_RPC reply;
 	bool vote = false;
-
-	printf("recv requestvote!\n");
-
-	if (s->state == LEADER)
-		printf("????leader\n");
+	bool validvote = false;
 
 	reply.rpc.type = REQUEST_VOTE_REPLY;
+	printf("Term%d recv requestvote from: %d(T%d)\n", s->curterm, from->peerid, ((RPC *)rpc)->term);
 
-	// Is a candidate new?
-	if (!s->voted && ((RPC *)rpc)->term > s->curterm) {
+	// TODO
+	assert(s->state != LEADER);
+
+	if (((RPC *)rpc)->term >= s->curterm) {
+		printf("recv request vote from newer peer state:%d\n", s->state);
+		if (s->state == FOLLOWER) {
+			validvote = true;
+		} else {	// candidate
+			voteDone(s);
+		}
+		setCurTerm(s, ((RPC *)rpc)->term);
+		s->state = FOLLOWER;
+	}
+
+	if (!s->voted && validvote) {
 		s->voted = true;
-		vote = true;	
+		vote = true;
+		printf("voted to %d\n", from->peerid);
+	} else {
+		printf("cannot vote to %d\n", from->peerid);
 	}
 
 	reply.voteGranted = vote;
-
 	sendrpc(s, (RPC *)&reply, sizeof reply, from);
 }
 
@@ -201,24 +225,38 @@ isMajority(RAFTSERVER *s) {
 }
 
 static void
-voteDone(RAFTSERVER *s) {
-	s->votes = 0;
-	s->voted = false;
-}
-
-static void
-recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
-	printf("recv requestvote reply!\n");
-
-	if (rpc->voteGranted) {
-		printf("voted from %d\n", from->peerid);
-		s->votes++;
-	}
+voteme(RAFTSERVER *s) {
+	s->votes++;
 
 	if (isMajority(s)) {
 		printf("won vote! become a leader\n");
 		s->state = LEADER;
+		s->leader = NULL;	// leader is me
 		voteDone(s);
+	}
+}
+
+static void
+recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
+	printf("Term%d: recv requestvote reply! %d(T%d)\n", s->curterm, from->peerid, ((RPC *)rpc)->term);
+
+	// rpc is too late
+	if (((RPC *)rpc)->term < s->curterm)
+		return;
+
+	// my raftserver is old
+	if (((RPC *)rpc)->term > s->curterm) {
+		printf("Term%d: vote from newer peer: %d Term:%d\n",
+		       s->curterm, from->peerid, ((RPC *)rpc)->term);
+		setCurTerm(s, ((RPC *)rpc)->term);
+		s->state = FOLLOWER;
+		voteDone(s);
+		return;
+	}
+
+	if (rpc->voteGranted) {
+		printf("voted from %d\n", from->peerid);
+		voteme(s);
 	}
 }
 
@@ -314,8 +352,9 @@ static void
 requestVote(RAFTSERVER *s) {
 	REQUEST_VOTE_RPC rpc;
 
-	assert(s->state == CANDIDATE);
-	printf("request vote\n");
+	if (s->state != CANDIDATE)
+		return;
+	printf("Term%d: request vote\n", s->curterm);
 
 	rpc.rpc.type = REQUEST_VOTE;
 	rpc.candidateId = s->myid;
@@ -360,6 +399,7 @@ ms2timespec(int ms) {
 static int
 heartbeatTimeout(RAFTSERVER *s) {
 	int high, low, range;
+	struct timeval tv;
 
 	high = s->htimeout_hi;
 	low = s->htimeout_lo;
@@ -367,7 +407,8 @@ heartbeatTimeout(RAFTSERVER *s) {
 	if (range < 0)
 		return 0;
 
-	srand(time(NULL));
+	gettimeofday(&tv, NULL);
+	srand(tv.tv_sec + tv.tv_usec);
 	return low + rand() % range;
 }
 
@@ -443,8 +484,8 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 
 	bzero(s, sizeof *s);
 	s->state = NONESTATE;
-	s->htimeout_lo = 150;
-	s->htimeout_hi = 300;		// heartbeat timeout is 150-300 ms
+	s->htimeout_lo = 100;
+	s->htimeout_hi = 250;		// heartbeat timeout is 100-250 ms
 	s->heartbeat_tick = 50;		// heartbeat per 50 ms
 	s->npeers = 0;
 
@@ -469,11 +510,12 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 
 static void
 election(RAFTSERVER *s) {
-	// vote me
-	s->votes++;
-	s->voted = true;
+	setCurTerm(s, s->curterm + 1);
 
-	s->curterm++;
+	printf("Term%d: voted to me!\n", s->curterm);
+
+	voteme(s);
+	s->voted = true;
 
 	requestVote(s);
 }
@@ -482,8 +524,6 @@ static void
 doHeartbeatTimeout(RAFTSERVER *s) {
 	if (s->state == LEADER)
 		return;
-
-	printf("timeout, start election\n");
 
 	if (s->state == CANDIDATE) {
 		printf("reelection\n");
@@ -533,6 +573,7 @@ servermain(RAFTSERVER *s) {
 	if (nready < 0)
 		return -1;
 	if (!nready) {
+		printf("timeout: %d ms\n", timeout);
 		doHeartbeatTimeout(s);
 		return 0;
 	}
