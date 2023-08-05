@@ -10,11 +10,11 @@ struct TCP {
 	struct sockaddr_in addr;	// IPv4 only
 };
 
-TCP *tcp_accept(int listenfd);
-TCP *connect_tcp(const char *host, int port);
-void tcp_disconnected(TCP *t);
-int tcp_listen(char *ipaddr, int port);
-ssize_t tcp_write(TCP *t, void *buf, size_t n);
-ssize_t tcp_read(TCP *t, void *buf, size_t n);
+TCP *tcpAccept(int listenfd);
+TCP *tcpConnect(const char *host, int port);
+void tcpDisconnected(TCP *t);
+int tcpListen(char *ipaddr, int port);
+ssize_t tcpSend(TCP *t, void *buf, size_t n);
+ssize_t tcpRecv(TCP *t, void *buf, size_t n);
 
 #endif

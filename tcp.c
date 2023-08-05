@@ -16,7 +16,7 @@
 #include "tcp.h"
 
 TCP *
-tcp_accept(int listenfd) {
+tcpAccept(int listenfd) {
 	TCP *t;
 	int clientfd;
 	struct sockaddr_in client_sin;
@@ -46,13 +46,13 @@ tcp_accept(int listenfd) {
 }
 
 static void
-tcp_free(TCP *t) {
+tcpFree(TCP *t) {
 	close(t->fd);
 	free(t);
 }
 
 TCP *
-connect_tcp(const char *host, int port) {
+tcpConnect(const char *host, int port) {
 	int sock;
 	TCP *t;
 	struct addrinfo hint = {0}, *res;
@@ -93,17 +93,17 @@ err:
 }
 
 void
-tcp_disconnected(TCP *t) {
+tcpDisconnected(TCP *t) {
 	char s[32];
 
 	inet_ntop(AF_INET, &t->addr.sin_addr, s, 32);
 	printf("disconnected @%s\n", s);
-	tcp_free(t);
+	tcpFree(t);
 }
 
 // IPv4 only
 int
-tcp_listen(char *ipaddr, int port) {
+tcpListen(char *ipaddr, int port) {
 	int sock;
 	int yes = 1;
 	struct sockaddr_in sin;
@@ -138,11 +138,11 @@ err:
 }
 
 ssize_t
-tcp_write(TCP *t, void *buf, size_t n) {
+tcpSend(TCP *t, void *buf, size_t n) {
 	return write(t->fd, buf, n);
 }
 
 ssize_t
-tcp_read(TCP *t, void *buf, size_t n) {
+tcpRecv(TCP *t, void *buf, size_t n) {
 	return read(t->fd, buf, n);
 }

@@ -49,30 +49,69 @@ struct RAFTPEER {
 	for (p = (s)->peers; (p) < &(s)->peers[8] && _np; (p)++)	\
 		if ((p)->active && _np--)
 
+typedef enum VAR VAR;
+enum VAR {
+	X,
+	Y,
+	Z,
+};
+
+typedef enum OP OP;
+enum OP {
+	SET,
+	ADD,
+	SUB,
+};
+
+typedef struct COMMAND COMMAND;
+struct COMMAND {
+	VAR var;
+	OP op;
+	int arg;	
+};
+
+typedef struct LOG LOG;
+struct LOG {
+	int term;
+	COMMAND cmd;
+};
+
+typedef struct MACHINESTATE MACHINESTATE;
+struct MACHINESTATE {
+	int var[3];
+};
+
 typedef struct RAFTSERVER RAFTSERVER;
 struct RAFTSERVER {
 	RSTATE state;
 
-	int htimeout_lo;
-	int htimeout_hi;
+	MACHINESTATE mstate;
 
-	int socket;
-	char *ipaddr;
+	int htimeoutLo;
+	int htimeoutHi;
+
+	int socket;	// listen socket
+	char *ipaddr;	// my ip address
 
 	RAFTPEER peers[8];
 	int npeers;
 
-	int myid;	
+	int myid;
 
 	timer_t timer;
-	int heartbeat_tick;
+	int heartbeatTick;
 
-	int curterm;
+	int curterm;	// currentTerm
 
 	int votes;
 	bool voted;	// already voted?
 
 	RAFTPEER *leader;
+
+	// log
+	LOG log[256];
+	int logIndex;
+	int commitIndex;
 };
 
 typedef enum RPCTYPE RPCTYPE;
@@ -108,9 +147,9 @@ typedef struct APPEND_ENTRIES_RPC APPEND_ENTRIES_RPC;
 struct APPEND_ENTRIES_RPC {
 	RPC rpc;
 	int leaderId;
-	int prevLogindex;
-	int prevLogterm;
-	char entries[32];
+	int prevLogIndex;
+	int prevLogTerm;
+	LOG entries[32];
 	int leaderCommit;
 };
 
@@ -168,20 +207,20 @@ static void
 sendrpc(RAFTSERVER *s, RPC *rpc, size_t size, RAFTPEER *target) {
 	rpc->term = s->curterm;
 
-	tcp_write(target->wrch, rpc, size);
+	tcpSend(target->wrch, rpc, size);
 }
 
 static size_t
 readrpc(RAFTPEER *from, RPC *rpc, size_t bufsize) {
 	TCP *rd = from->rdch;
 
-	return tcp_read(rd, rpc, bufsize);
+	return tcpRecv(rd, rpc, bufsize);
 }
 
 static void
 peerDisconnected(RAFTSERVER *s, RAFTPEER *peer) {
-	tcp_disconnected(peer->wrch);
-	tcp_disconnected(peer->rdch);
+	tcpDisconnected(peer->wrch);
+	tcpDisconnected(peer->rdch);
 	peer->wrch = NULL;
 	peer->rdch = NULL;
 	peer->active = false;
@@ -295,14 +334,35 @@ recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	}
 }
 
+#define foreachLog(entry, log, n)	\
+	for ((entry) = (log); (entry) < &(log)[(n)] && (entry)->term != 0; (entry)++)
+
 static void
 recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
+	APPEND_ENTRIES_REP_RPC reply;
+	LOG *entry;
+	int index;
+	
 	if (biszero(rpc->entries, sizeof rpc->entries)) {	// is heartbeat?
 		recvHeartbeat(s, from, rpc);
 		return;
 	}
 
-	printf("entries: \n");
+	reply.rpc.type = APPEND_ENTRIES_REPLY;
+	reply.success = false;
+
+	if (rpc->prevLogIndex < 0 ||
+	    s->log[rpc->prevLogIndex].term == rpc->prevLogTerm) {
+		index = rpc->prevLogIndex + 1;
+		foreachLog(entry, rpc->entries, 32) {
+			s->log[index] = *entry;
+			index++;
+		}
+
+		reply.success = true;
+	}
+
+	sendrpc(s, (RPC *)&reply, sizeof reply, from);
 }
 
 static void
@@ -348,6 +408,36 @@ rpcbcast(RAFTSERVER *s, RPC *rpc, size_t size) {
 }
 
 static void
+newLog(RAFTSERVER *s, LOG *log) {
+	s->log[s->logIndex] = *log;
+}
+
+static void
+appendEntries(RAFTSERVER *s, size_t n) {
+	APPEND_ENTRIES_RPC rpc;
+	int prevLogIndex;
+	LOG *log;
+
+	if (s->state != LEADER)
+		return;
+
+	rpc.rpc.type = APPEND_ENTRIES;
+	rpc.leaderId = s->myid;
+	prevLogIndex = s->logIndex - 1;
+	rpc.prevLogIndex = prevLogIndex;
+	if (prevLogIndex >= 0)
+		rpc.prevLogTerm = s->log[prevLogIndex].term;
+	else
+		rpc.prevLogTerm = -1;
+	rpc.leaderCommit = s->commitIndex;
+
+	log = s->log + s->logIndex;
+	memcpy(rpc.entries, log, sizeof(LOG) * n);
+
+	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
+}
+
+static void
 requestVote(RAFTSERVER *s) {
 	REQUEST_VOTE_RPC rpc;
 
@@ -372,10 +462,10 @@ sendHeartbeat(RAFTSERVER *s) {
 
 	rpc.rpc.type = APPEND_ENTRIES;
 	rpc.leaderId = s->myid;
-	rpc.prevLogindex = 0;
-	rpc.prevLogterm = 0;
+	rpc.prevLogIndex = 0;
+	rpc.prevLogTerm = 0;
 	bzero(rpc.entries, sizeof rpc.entries);
-	rpc.leaderCommit = 0;	// TODO
+	rpc.leaderCommit = s->commitIndex;
 
 	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
 }
@@ -400,8 +490,8 @@ heartbeatTimeout(RAFTSERVER *s) {
 	int high, low, range;
 	struct timeval tv;
 
-	high = s->htimeout_hi;
-	low = s->htimeout_lo;
+	high = s->htimeoutHi;
+	low = s->htimeoutLo;
 	range = high - low;
 	if (range < 0)
 		return 0;
@@ -422,8 +512,8 @@ tickinit(RAFTSERVER *s, void (*callback)(union sigval)) {
 	se.sigev_notify_function = callback;
 	se.sigev_notify_attributes = NULL;
 
-	ts.it_value = ms2timespec(s->heartbeat_tick);
-	ts.it_interval = ms2timespec(s->heartbeat_tick);
+	ts.it_value = ms2timespec(s->heartbeatTick);
+	ts.it_interval = ms2timespec(s->heartbeatTick);
 
 	if (timer_create(CLOCK_MONOTONIC, &se, &timer) < 0) {
 		printf("timer_create!");
@@ -460,7 +550,7 @@ connectallserv(RAFTSERVER *s, int nservs) {
 		}
 
 		peer = &s->peers[peeridx];
-		ch = connect_tcp(iplist[i], 1145);
+		ch = tcpConnect(iplist[i], 1145);
 		if (ch) {
 			connected |= 1 << i;
 			peer->wrch = ch;
@@ -483,12 +573,12 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 
 	bzero(s, sizeof *s);
 	s->state = NONESTATE;
-	s->htimeout_lo = 100;
-	s->htimeout_hi = 250;		// heartbeat timeout is 100-250 ms
-	s->heartbeat_tick = 50;		// heartbeat per 50 ms
+	s->htimeoutLo = 100;
+	s->htimeoutHi = 250;		// heartbeat timeout is 100-250 ms
+	s->heartbeatTick = 50;		// heartbeat per 50 ms
 	s->npeers = 0;
 
-	sock = tcp_listen(myip, port);	// establish tcp connection
+	sock = tcpListen(myip, port);	// establish tcp connection
 	if (sock < 0) {
 		printf ("listen failed\n");
 		return;
@@ -583,7 +673,7 @@ servermain(RAFTSERVER *s) {
 			continue;
 		
 		if (pfd->fd == s->socket) {
-			rdch = tcp_accept(s->socket);
+			rdch = tcpAccept(s->socket);
 			if (!rdch)
 				return -1;
 
