@@ -41,6 +41,8 @@ struct RAFTPEER {
 	struct sockaddr_in addr;
 	int peerid;
 
+	int logIndex;
+
 	bool active;
 };
 
@@ -76,6 +78,12 @@ struct LOG {
 	COMMAND cmd;
 };
 
+// Raft client
+typedef struct CLIENT CLIENT;
+struct CLIENT {
+	TCP *ch;
+};
+
 typedef struct MACHINESTATE MACHINESTATE;
 struct MACHINESTATE {
 	int var[3];
@@ -96,6 +104,8 @@ struct RAFTSERVER {
 	RAFTPEER peers[8];
 	int npeers;
 
+	RAFTPEER *leader;
+
 	int myid;
 
 	timer_t timer;
@@ -106,12 +116,12 @@ struct RAFTSERVER {
 	int votes;
 	bool voted;	// already voted?
 
-	RAFTPEER *leader;
-
 	// log
 	LOG log[256];
 	int logIndex;
 	int commitIndex;
+
+	CLIENT *client;
 };
 
 typedef enum RPCTYPE RPCTYPE;
@@ -316,9 +326,7 @@ static void
 recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	RAFTPEER *prevleader = s->leader;
 
-	// old heartbeat is denied
-	if (((RPC *)rpc)->term < s->curterm)
-		return;
+	printf("recv heartbeat!!!!!!!\n");
 
 	if (s->state == CANDIDATE || s->state == LEADER) {
 		// other peer became LEADER
@@ -343,6 +351,9 @@ recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	LOG *entry;
 	int index;
 	
+	if (((RPC *)rpc)->term < s->curterm)
+		return;
+
 	if (biszero(rpc->entries, sizeof rpc->entries)) {	// is heartbeat?
 		recvHeartbeat(s, from, rpc);
 		return;
@@ -360,6 +371,8 @@ recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 		}
 
 		reply.success = true;
+
+		// TODO: commitIndex
 	}
 
 	sendrpc(s, (RPC *)&reply, sizeof reply, from);
@@ -367,6 +380,9 @@ recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 
 static void
 recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc) {
+	if (((RPC *)rpc)->term < s->curterm)
+		return;
+
 	printf("recv append entries reply!\n");
 }
 
@@ -413,7 +429,23 @@ newLog(RAFTSERVER *s, LOG *log) {
 }
 
 static void
-appendEntries(RAFTSERVER *s, size_t n) {
+requestVote(RAFTSERVER *s) {
+	REQUEST_VOTE_RPC rpc;
+
+	if (s->state != CANDIDATE)
+		return;
+	rlog(s, "request vote\n");
+
+	rpc.rpc.type = REQUEST_VOTE;
+	rpc.candidateId = s->myid;
+	rpc.lastLogindex = 0;
+	rpc.lastLogterm = 0;
+
+	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
+}
+
+static void
+appendEntries(RAFTSERVER *s, bool heartbeat) {
 	APPEND_ENTRIES_RPC rpc;
 	int prevLogIndex;
 	LOG *log;
@@ -431,46 +463,24 @@ appendEntries(RAFTSERVER *s, size_t n) {
 		rpc.prevLogTerm = -1;
 	rpc.leaderCommit = s->commitIndex;
 
-	log = s->log + s->logIndex;
-	memcpy(rpc.entries, log, sizeof(LOG) * n);
-
-	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
-}
-
-static void
-requestVote(RAFTSERVER *s) {
-	REQUEST_VOTE_RPC rpc;
-
-	if (s->state != CANDIDATE)
-		return;
-	rlog(s, "request vote\n");
-
-	rpc.rpc.type = REQUEST_VOTE;
-	rpc.candidateId = s->myid;
-	rpc.lastLogindex = 0;
-	rpc.lastLogterm = 0;
+	if (heartbeat) {
+		printf("send heartbeat\n");
+		bzero(rpc.entries, sizeof rpc.entries);
+	} else {
+		// FIXME
+		// log = s->log + s->logIndex;
+		// memcpy(rpc.entries, log, sizeof(LOG) * n);
+	}
 
 	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
 }
 
 static void
 sendHeartbeat(RAFTSERVER *s) {
-	APPEND_ENTRIES_RPC rpc;
-
-	if (s->state != LEADER)
-		return;
-
-	rpc.rpc.type = APPEND_ENTRIES;
-	rpc.leaderId = s->myid;
-	rpc.prevLogIndex = 0;
-	rpc.prevLogTerm = 0;
-	bzero(rpc.entries, sizeof rpc.entries);
-	rpc.leaderCommit = s->commitIndex;
-
-	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
+	appendEntries(s, true);
 }
 
-void
+static void
 heartbeat(union sigval sv) {
 	RAFTSERVER *s = sv.sival_ptr;
 
@@ -501,7 +511,7 @@ heartbeatTimeout(RAFTSERVER *s) {
 	return low + rand() % range;
 }
 
-static void
+static int
 tickinit(RAFTSERVER *s, void (*callback)(union sigval)) {
 	struct sigevent se;
 	struct itimerspec ts;
@@ -517,14 +527,16 @@ tickinit(RAFTSERVER *s, void (*callback)(union sigval)) {
 
 	if (timer_create(CLOCK_MONOTONIC, &se, &timer) < 0) {
 		printf("timer_create!");
-		return;
+		return -1;
 	}
 	if (timer_settime(timer, 0, &ts, 0) < 0) {
 		printf("timer_settime!");
-		return;
+		return -1;
 	}
 
 	s->timer = timer;
+
+	return 0;
 }
 
 static void
@@ -565,7 +577,7 @@ connectallserv(RAFTSERVER *s, int nservs) {
 	} while (connected != mask);
 }
 
-static void
+static int
 serverinit(RAFTSERVER *s, int myid, int nservs) {
 	int sock;
 	char *myip = iplist[myid];
@@ -581,7 +593,7 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 	sock = tcpListen(myip, port);	// establish tcp connection
 	if (sock < 0) {
 		printf ("listen failed\n");
-		return;
+		return -1;
 	}
 	printf("listen at %s:%d...\n", myip, port);
 	s->socket = sock;
@@ -590,11 +602,12 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 
 	connectallserv(s, nservs);
 
-	tickinit(s, heartbeat);
+	if (tickinit(s, heartbeat) < 0)
+		return -1;
 
 	s->state = FOLLOWER;
 
-	printf("serverinitdone\n");
+	return 0;
 }
 
 static void
@@ -623,10 +636,34 @@ doHeartbeatTimeout(RAFTSERVER *s) {
 	election(s);
 }
 
+static void
+newClient(RAFTSERVER *s, TCP *ch) {
+	CLIENT *c = malloc(sizeof *c);
+	if (!c)
+		return;
+
+	rlog(s, "new client!\n");
+
+	c->ch = ch;
+	if (s->client)
+		printf("double!?\n");
+	s->client = c;
+}
+
+static void
+clientDisconnected(RAFTSERVER *s) {
+	CLIENT *c = s->client;
+
+	tcpDisconnected(c->ch);
+	free(c);
+	s->client = NULL;
+}
+
 static int
 raftpollfd(RAFTSERVER *s, struct pollfd *fds, RAFTPEER **peers) {
 	int nfds;
 	RAFTPEER *peer;
+	CLIENT *c = s->client;
 	TCP *rdch;
 	int pi = 0;
 
@@ -640,6 +677,10 @@ raftpollfd(RAFTSERVER *s, struct pollfd *fds, RAFTPEER **peers) {
 
 		fds[nfds++] = (struct pollfd){ .fd = rdch->fd, .events = POLLIN };		
 		peers[pi++] = peer;
+	}
+
+	if (c) {
+		fds[nfds++] = (struct pollfd){ .fd = c->ch->fd, .events = POLLIN };
 	}
 
 	return nfds;
@@ -678,13 +719,14 @@ servermain(RAFTSERVER *s) {
 				return -1;
 
 			peer = peerbyip(s, rdch->addr);
-			if (!peer) {
-				rlog(s, "no peer!\n");
-				return -1;
+			if (peer) {
+				peer->rdch = rdch;
+				rlog(s, "new peer!: %d\n", peer->peerid);
+			} else {
+				newClient(s, rdch);
 			}
-			peer->rdch = rdch;
-
-			rlog(s, "new peer!: %d\n", peer->peerid);
+		} else if (s->client && pfd->fd == s->client->ch->fd) {
+			printf("client nanka kita w\n");
 		} else {
 			peer = peers[i - 1];
 			recvrpc(s, peer);
@@ -706,8 +748,9 @@ main(int argc, char *argv[]) {
 		return -1;
 	me = atoi(argv[1]);
 
-	// ./raft 1 
-	serverinit(&server, me, n);
+	rc = serverinit(&server, me, n);
+	if (rc)
+		return rc;
 	
 	for (;;) {
 		rc = servermain(&server);

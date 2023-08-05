@@ -12,7 +12,7 @@ $ make
 $ ./demons.sh
 ```
 
-- execution
+- execution (require sudo)
 ```
 # in console 1
 $ ./raft 0
