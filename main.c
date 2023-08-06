@@ -249,7 +249,7 @@ peerIsMoreUptoDate(RAFTSERVER *s, int lastindex, int lastterm) {
 		return true;
 
 	if (lastterm == s->log[s->logIndex].term) {
-		return rpc->lastLogIndex >= s->logIndex;
+		return lastindex >= s->logIndex;
 	} else {
 		return lastterm > s->log[s->logIndex].term;
 	}
@@ -536,8 +536,8 @@ requestVote(RAFTSERVER *s) {
 
 	rpc.rpc.type = REQUEST_VOTE;
 	rpc.candidateId = s->myid;
-	rpc.lastLogindex = 0;
-	rpc.lastLogterm = 0;
+	rpc.lastLogIndex = 0;
+	rpc.lastLogTerm = 0;
 
 	bcastrpc(s, (RPC *)&rpc, sizeof rpc);
 }
