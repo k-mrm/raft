@@ -964,6 +964,8 @@ main(int argc, char *argv[]) {
 		return -1;
 	me = atoi(argv[1]);
 
+	signal(SIGPIPE, SIG_IGN);
+
 	rc = serverinit(&server, me, N);
 	if (rc) {
 		return rc;
