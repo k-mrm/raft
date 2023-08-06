@@ -925,8 +925,10 @@ servermain(RAFTSERVER *s) {
 		
 		if (pfd->fd == s->socket) {
 			rdch = tcpAccept(s->socket);
-			if (!rdch)
+			if (!rdch) {
+				printf("accept failed\n");
 				return -1;
+			}
 
 			// from client
 			if (ntohs(rdch->addr.sin_port) == 1919) {
