@@ -93,11 +93,11 @@ err:
 }
 
 void
-tcpDisconnected(TCP *t) {
+tcpDisconnect(TCP *t) {
 	char s[32];
 
 	inet_ntop(AF_INET, &t->addr.sin_addr, s, 32);
-	printf("disconnected @%s\n", s);
+	printf("disconnect @%s\n", s);
 	tcpFree(t);
 }
 

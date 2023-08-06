@@ -12,7 +12,7 @@ struct TCP {
 
 TCP *tcpAccept(int listenfd);
 TCP *tcpConnect(const char *host, int port);
-void tcpDisconnected(TCP *t);
+void tcpDisconnect(TCP *t);
 int tcpListen(char *ipaddr, int port);
 ssize_t tcpSend(TCP *t, void *buf, size_t n);
 ssize_t tcpRecv(TCP *t, void *buf, size_t n);
