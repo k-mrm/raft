@@ -535,11 +535,8 @@ __appendEntries(RAFTSERVER *s, RAFTPEER *p, bool heartbeat) {
 	if (s->state != LEADER) {
 		return;
 	}
-	if (!heartbeat && s->logIndex < 0) {	// no log entires!
-		return;
-	}
 
-	prevLogIndex = s->logIndex - 1;
+	prevLogIndex = p->nextIndex - 1;
 	if (prevLogIndex >= 0) {
 		prevLogTerm = s->log[prevLogIndex].term;
 	} else {
@@ -554,8 +551,7 @@ __appendEntries(RAFTSERVER *s, RAFTPEER *p, bool heartbeat) {
 
 	assert(biszero(rpc->entries, sizeof rpc->entries));
 	if (heartbeat) {
-		bcastrpc(s, (RPC *)rpc, sizeof *rpc);
-		goto end;
+		goto send;
 	}
 
 	eidx = 0;
@@ -574,6 +570,7 @@ __appendEntries(RAFTSERVER *s, RAFTPEER *p, bool heartbeat) {
 		*l = s->log[i];
 	}
 
+send:
 	sendrpc(s, (RPC *)rpc, sizeof *rpc, p);
 end:
 	free(rpc);
@@ -590,7 +587,11 @@ appendEntries(RAFTSERVER *s) {
 
 static void
 sendHeartbeat(RAFTSERVER *s) {
-	__appendEntries(s, NULL, true);
+	RAFTPEER *p;
+
+	foreachPeer(s, p) {
+		__appendEntries(s, p, true);
+	}
 }
 
 static void
@@ -657,9 +658,11 @@ static RAFTPEER *
 allocpeer(RAFTSERVER *s) {
 	RAFTPEER *p;
 
-	for (p = s->peers; p < &s->peers[8]; p++) {
+	for (int i = 0; i < 8; i++) {
+		p = s->peers + i;
 		if (!p->active) {
 			p->active = true;
+			p->peerid = i;
 			return p;
 		}
 	}
@@ -668,7 +671,7 @@ allocpeer(RAFTSERVER *s) {
 }
 
 static void
-connectallserv(RAFTSERVER *s, int nservs) {
+connectallpeer(RAFTSERVER *s, int nservs) {
 	int peeridx = 0;
 	int i = 0;
 	RAFTPEER *peer;
@@ -736,7 +739,7 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 	s->myid = myid;
 	s->ipaddr = myip;
 
-	connectallserv(s, nservs);
+	connectallpeer(s, nservs);
 
 	if (tickinit(s, heartbeat) < 0) {
 		return -1;
@@ -868,7 +871,26 @@ raftpollfd(RAFTSERVER *s, struct pollfd *fds, RAFTPEER **peers) {
 
 static void
 peerReconnected(RAFTSERVER *s, TCP *ch) {
-	;
+	RAFTPEER *p;
+	TCP *wrch;
+
+	p = allocpeer(s);
+	if (!p) {
+		return;
+	}
+
+	rinfo(s, "peer reconnected! from %d:%s\n", p->peerid, iplist[p->peerid]);
+
+	wrch = tcpConnect(iplist[p->peerid], 1145, 0);
+	if (!wrch) {
+		return;
+	}
+
+	p->wrch = wrch;
+	p->rdch = ch;
+	p->addr = ch->addr;
+
+	s->npeers++;
 }
 
 static int
