@@ -5,11 +5,13 @@
 #include <time.h>
 #include <stdbool.h>
 #include <signal.h>
+#include <sys/time.h>
 #include <sys/timerfd.h>
 #include <assert.h>
 #include <poll.h>
 #include <arpa/inet.h>
 #include "tcp.h"
+#include "log.h"
 
 #define min(a, b)	((a) < (b) ? (a) : (b))
 
@@ -54,33 +56,6 @@ struct RAFTPEER {
 	for (p = (s)->peers; (p) < &(s)->peers[8] && _np; (p)++)	\
 		if ((p)->active && _np--)
 
-typedef enum VAR VAR;
-enum VAR {
-	X,
-	Y,
-	Z,
-};
-
-typedef enum OP OP;
-enum OP {
-	SET,
-	ADD,
-	SUB,
-};
-
-typedef struct COMMAND COMMAND;
-struct COMMAND {
-	VAR var;
-	OP op;
-	int arg;	
-};
-
-typedef struct LOG LOG;
-struct LOG {
-	int term;
-	COMMAND cmd;
-};
-
 // Raft client
 typedef struct CLIENT CLIENT;
 struct CLIENT {
@@ -121,7 +96,7 @@ struct RAFTSERVER {
 
 	// log
 	LOG log[256];
-	int logIndex;
+	int logIndex;	// last log index
 	int commitIndex;
 	int lastApplied;
 
@@ -173,6 +148,8 @@ struct APPEND_ENTRIES_REP_RPC {
 	bool success;
 };
 
+static void __appendEntries(RAFTSERVER *s, RAFTPEER *p, bool heartbeat);
+
 #define rinfo(s, fmt, ...)	\
 	printf("R%d[%s] (Term%d): " fmt, (s)->myid, st[(s)->state], (s)->curterm, ##__VA_ARGS__)
 
@@ -195,7 +172,7 @@ becomeLeader(RAFTSERVER *s) {
 	s->leader = NULL;
 
 	foreachPeer (s, p) {
-		p->nextIndex = s->logIndex;
+		p->nextIndex = s->logIndex + 1;
 		p->matchIndex = -1;
 	}
 }
@@ -365,13 +342,15 @@ logDump(LOG *log, int n) {
 	LOG *entry;
 
 	foreachLog(entry, log, n) {
-		printf("log T%d %d %d\n", entry->term, entry->cmd.op, entry->cmd.arg);
+		// printf("log T%d %d %d\n", entry->term, entry->cmd.op, entry->cmd.arg);
+		printf("log T%d %s\n", entry->term, entry->s);
 	}
 }
 
 static void
 appendLog(RAFTSERVER *s, LOG *log) {
-	s->log[s->logIndex++] = *log;
+	s->logIndex++;
+	s->log[s->logIndex] = *log;
 }
 
 static void
@@ -408,14 +387,16 @@ recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 
 	if (rpc->prevLogIndex == -1 ||
 	    s->log[rpc->prevLogIndex].term == rpc->prevLogTerm) {
+		reply.success = true;
+
+		// TODO: confilict check
+
 		foreachLog(entry, rpc->entries, 32) {
 			appendLog(s, entry);
 		}
 
-		reply.success = true;
-
 		if (rpc->leaderCommit > s->commitIndex) {
-			s->commitIndex = min(rpc->leaderCommit, s->logIndex - 1);
+			s->commitIndex = min(rpc->leaderCommit, s->logIndex);
 			commit(s);
 		}
 	}
@@ -437,10 +418,13 @@ recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc)
 	}
 
 	if (rpc->success) {
-		;
+		from->nextIndex = s->logIndex + 1;
+		from->matchIndex = s->logIndex;
 	} else {
 		// resend append entries
-		;
+		from->nextIndex--;
+
+		__appendEntries(s, from, false);
 	}
 }
 
@@ -511,51 +495,58 @@ allocrpc(RPCTYPE type, size_t size) {
 }
 
 static void
-appendEntries(RAFTSERVER *s, bool heartbeat) {
+__appendEntries(RAFTSERVER *s, RAFTPEER *p, bool heartbeat) {
 	APPEND_ENTRIES_RPC *rpc;
-	RAFTPEER *p;
 	int prevLogIndex, prevLogTerm;
-	int next, eidx = 0;
+	int eidx = 0;
 
 	if (s->state != LEADER)
 		return;
 
-	prevLogIndex = s->logIndex - 1;
+	prevLogIndex = s->logIndex;
 	if (prevLogIndex >= 0)
 		prevLogTerm = s->log[prevLogIndex].term;
 	else
 		prevLogTerm = -1;
 
+	rpc = (APPEND_ENTRIES_RPC *)allocrpc(APPEND_ENTRIES, sizeof *rpc);
+	rpc->leaderId = s->myid;
+	rpc->prevLogIndex = prevLogIndex;
+	rpc->prevLogTerm = prevLogTerm;
+	rpc->leaderCommit = s->commitIndex;
+
+	if (heartbeat) {
+		bcastrpc(s, (RPC *)rpc, sizeof *rpc);
+		goto end;
+	}
+
+	eidx = 0;
+	if (s->logIndex < p->nextIndex)
+		goto end;
+	for (int i = p->nextIndex; i <= s->logIndex; i++, eidx++) {
+		if (eidx >= 32)
+			goto end;
+		LOG *l = rpc->entries + eidx;
+		*l = s->log[i];
+	}
+
+	sendrpc(s, (RPC *)rpc, sizeof *rpc, p);
+end:
+	free(rpc);
+}
+
+static void
+appendEntries(RAFTSERVER *s) {
+	RAFTPEER *p;
+
 	foreachPeer(s, p) {
-		rpc = (APPEND_ENTRIES_RPC *)allocrpc(APPEND_ENTRIES, sizeof *rpc);
-		rpc->leaderId = s->myid;
-		rpc->prevLogIndex = prevLogIndex;
-		rpc->prevLogTerm = prevLogTerm;
-		rpc->leaderCommit = s->commitIndex;
-
-		if (heartbeat) {
-			bcastrpc(s, (RPC *)rpc, sizeof *rpc);
-			free(rpc);
-			return;
-		}
-
-		next = p->nextIndex;
-		eidx = 0;
-		for (int i = next; i < s->logIndex; i++, eidx++) {
-			if (eidx >= 32)
-				return;
-			LOG *l = rpc->entries + eidx;
-			*l = s->log[i];
-		}
-
-		sendrpc(s, (RPC *)rpc, sizeof *rpc, p);
-		free(rpc);
+		__appendEntries(s, p, false);
 	}
 }
 
 static void
 sendHeartbeat(RAFTSERVER *s) {
-	appendEntries(s, true);
+	__appendEntries(s, NULL, true);
 }
 
 static void
@@ -667,6 +658,7 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 	s->htimeoutHi = 250;		// heartbeat timeout is 100-250 ms
 	s->heartbeatTick = 50;		// heartbeat per 50 ms
 	s->npeers = 0;
+	s->logIndex = -1;
 	s->commitIndex = -1;
 	s->lastApplied = -1;
 
@@ -766,6 +758,8 @@ recvClientReq(RAFTSERVER *s) {
 	}
 
 	logDump(&buf, 1);
+	appendLog(s, &buf);
+	appendEntries(s);
 }
 
 static int
