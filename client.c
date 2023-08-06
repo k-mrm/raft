@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <arpa/inet.h>
 #include "tcp.h"
+#include "cmd.h"
 
 TCP *serv;
 

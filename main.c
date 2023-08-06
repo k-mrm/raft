@@ -11,15 +11,18 @@
 #include <poll.h>
 #include <arpa/inet.h>
 #include "tcp.h"
-#include "log.h"
+#include "cmd.h"
 
 #define min(a, b)	((a) < (b) ? (a) : (b))
 
 #define N	3
-char *iplist[N] = {
+
+char *iplist[5] = {
 	"10.0.0.100",
 	"10.0.0.1",
 	"10.0.0.2",
+	"10.0.0.3",
+	"10.0.0.4",
 };
 
 typedef enum RSTATE RSTATE;
@@ -65,7 +68,14 @@ struct CLIENT {
 
 typedef struct MACHINESTATE MACHINESTATE;
 struct MACHINESTATE {
-	int var[3];
+	int var[26];
+};
+
+typedef struct LOG LOG;
+struct LOG {
+	int term;
+	// COMMAND cmd;
+	char s[12];	// tmp
 };
 
 typedef struct RAFTSERVER RAFTSERVER;
@@ -123,8 +133,8 @@ typedef struct REQUEST_VOTE_RPC REQUEST_VOTE_RPC;
 struct REQUEST_VOTE_RPC {
 	RPC rpc;
 	int candidateId;
-	int lastLogindex;
-	int lastLogterm;
+	int lastLogIndex;
+	int lastLogTerm;
 };
 
 typedef struct REQUEST_VOTE_REP_RPC REQUEST_VOTE_REP_RPC;
@@ -233,6 +243,18 @@ peerDisconnected(RAFTSERVER *s, RAFTPEER *peer) {
 	s->npeers--;
 }
 
+static bool
+peerIsMoreUptoDate(RAFTSERVER *s, int lastindex, int lastterm) {
+	if (s->logIndex == -1)
+		return true;
+
+	if (lastterm == s->log[s->logIndex].term) {
+		return rpc->lastLogIndex >= s->logIndex;
+	} else {
+		return lastterm > s->log[s->logIndex].term;
+	}
+}
+
 static void
 recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 	REQUEST_VOTE_REP_RPC reply;
@@ -245,8 +267,7 @@ recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 	if (((RPC *)rpc)->term >= s->curterm) {
 		rinfo(s, "recv request vote from newer peer\n");
 		if (s->state == FOLLOWER) {
-			// validate lastLogindex/term
-			if (rpc->lastLogindex >= s->logIndex) {
+			if (peerIsMoreUptoDate(s, rpc->lastLogIndex, rpc->lastLogTerm)) {
 				validvote = true;
 			}
 		} else {	// candidate
@@ -349,7 +370,6 @@ logDump(LOG *log, int n) {
 
 static void
 appendLog(RAFTSERVER *s, LOG *log) {
-	log->term = s->curterm;
 	s->logIndex++;
 	s->log[s->logIndex] = *log;
 }
@@ -719,8 +739,9 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 
 	connectallserv(s, nservs);
 
-	if (tickinit(s, heartbeat) < 0)
+	if (tickinit(s, heartbeat) < 0) {
 		return -1;
+	}
 
 	s->state = FOLLOWER;
 
@@ -788,7 +809,7 @@ clientDisconnected(RAFTSERVER *s) {
 static void
 recvClientReq(RAFTSERVER *s) {
 	CLIENT *c = s->client;
-	LOG buf;
+	LOG log;
 	size_t n;
 
 	if (s->state != LEADER) {
@@ -797,14 +818,16 @@ recvClientReq(RAFTSERVER *s) {
 		return;
 	}
 	
-	n = tcpRecv(c->ch, &buf, sizeof buf);
+	n = tcpRecv(c->ch, log.s, sizeof log.s);
 	if (n == 0) {
 		clientDisconnected(s);
 		return;
 	}
 
-	logDump(&buf, 1);
-	appendLog(s, &buf);
+	log.term = s->curterm;
+
+	logDump(&log, 1);
+	appendLog(s, &log);
 	appendEntries(s);
 }
 
