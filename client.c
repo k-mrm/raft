@@ -24,6 +24,7 @@ clientmain() {
 	size_t s;
 	int r;
 
+	printf("internal cmd p: print log, c: print committed log\n");
 	while (!terminated) {
 		printf("> ");
 		r = scanf("%12s", msg);
