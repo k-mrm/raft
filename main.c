@@ -572,11 +572,13 @@ __appendEntries(RAFTSERVER *s, RAFTPEER *p, bool heartbeat) {
 		goto end;
 	}
 	for (int i = p->nextIndex; i <= s->logIndex; i++, eidx++) {
+		LOG *l;
+
 		rinfo(s, "%d: appendEntires: %d\n", eidx, i);
 		if (eidx >= 32) {
 			goto end;
 		}
-		LOG *l = rpc->entries + eidx;
+		l = rpc->entries + eidx;
 		*l = s->log[i];
 	}
 
@@ -909,12 +911,14 @@ main(int argc, char *argv[]) {
 	me = atoi(argv[1]);
 
 	rc = serverinit(&server, me, N);
-	if (rc)
+	if (rc) {
 		return rc;
+	}
 	
 	for (;;) {
 		rc = servermain(&server);
-		if (rc)
+		if (rc) {
 			return rc;
+		}
 	}
 }
