@@ -404,8 +404,33 @@ recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	sendrpc(s, (RPC *)&reply, sizeof reply, from);
 }
 
+// if N is not found, return -1
+static int
+getN(RAFTSERVER *s) {
+	int count;
+	int maxN = -1;
+
+	for (int n = s->commitIndex + 1; n <= s->logIndex; n++) {
+		count = 0;
+		foreachPeer(s, p) {
+			if (p->matchIndex >= n) {
+				count++;
+			}
+		}
+		// count is major and same term
+		if ((count * 2 > s->npeers + 1) && s->log[n].term == s->curterm) {
+			maxN = n;
+		}
+	}
+
+	return maxN;
+}
+
 static void
 recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc) {
+	int n;
+	RAFTPEER *p;
+
 	if (((RPC *)rpc)->term < s->curterm)
 		return;
 
@@ -420,6 +445,17 @@ recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc)
 	if (rpc->success) {
 		from->nextIndex = s->logIndex + 1;
 		from->matchIndex = s->logIndex;
+
+		/* 
+		 * If there exists an N such that N > commitIndex, a majority
+		 * of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+		 * set commitIndex = N (§5.3, §5.4)
+		 */
+		n = getN(s);
+		if (n >= 0) {
+			s->commitIndex = n;
+			commit(s);
+		}
 	} else {
 		// resend append entries
 		from->nextIndex--;
@@ -504,10 +540,11 @@ __appendEntries(RAFTSERVER *s, RAFTPEER *p, bool heartbeat) {
 		return;
 
 	prevLogIndex = s->logIndex;
-	if (prevLogIndex >= 0)
+	if (prevLogIndex >= 0) {
 		prevLogTerm = s->log[prevLogIndex].term;
-	else
+	} else {
 		prevLogTerm = -1;
+	}
 
 	rpc = (APPEND_ENTRIES_RPC *)allocrpc(APPEND_ENTRIES, sizeof *rpc);
 	rpc->leaderId = s->myid;
@@ -521,11 +558,13 @@ __appendEntries(RAFTSERVER *s, RAFTPEER *p, bool heartbeat) {
 	}
 
 	eidx = 0;
-	if (s->logIndex < p->nextIndex)
+	if (s->logIndex < p->nextIndex) {
 		goto end;
+	}
 	for (int i = p->nextIndex; i <= s->logIndex; i++, eidx++) {
-		if (eidx >= 32)
+		if (eidx >= 32) {
 			goto end;
+		}
 		LOG *l = rpc->entries + eidx;
 		*l = s->log[i];
 	}
@@ -572,8 +611,9 @@ heartbeatTimeout(RAFTSERVER *s) {
 	high = s->htimeoutHi;
 	low = s->htimeoutLo;
 	range = high - low;
-	if (range < 0)
+	if (range < 0) {
 		return 0;
+	}
 
 	gettimeofday(&tv, NULL);
 	srand(tv.tv_sec + tv.tv_usec);
