@@ -27,11 +27,13 @@ clientmain() {
 	while (!terminated) {
 		printf("> ");
 		r = scanf("%12s", msg);
-		if (r == EOF)
+		if (r == EOF) {
 			break;
+		}
 		s = tcpSend(serv, msg, sizeof msg);
-		if (s == 0)
+		if (s == 0) {
 			break;
+		}
 		memset(msg, 0, sizeof msg);
 	}
 
@@ -41,17 +43,11 @@ clientmain() {
 
 static int
 doClient(char *servIp) {
-	int rc;
-
 	serv = tcpConnect(servIp, 1145);
 	if (!serv)
 		return -1;
 
-	for (;;) {
-		rc = clientmain();
-		if (rc)
-			return rc;
-	}
+	return clientmain();
 }
 
 int
@@ -60,7 +56,6 @@ main(int argc, char **argv) {
 		return -1;
 
 	signal(SIGINT, sighandler);
-	signal(SIGTERM, sighandler);
 
 	return doClient(argv[1]);
 }

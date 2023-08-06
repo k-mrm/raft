@@ -330,7 +330,7 @@ static void
 logDump(LOG *log, int n) {
 	LOG *entry;
 
-	printf("log dump:\n");
+	printf("log dump %d:\n", n);
 	foreachLog(entry, log, n) {
 		// printf("log T%d %d %d\n", entry->term, entry->cmd.op, entry->cmd.arg);
 		printf("log T%d %12s\n", entry->term, entry->s);
@@ -352,7 +352,7 @@ commit(RAFTSERVER *s) {
 	for (int i = start; i <= s->commitIndex; i++) {
 		log = s->log + i;
 		// TODO: do cmd
-		rinfo(s, "commit log%d! LOG{T%d:%s}\n", i, log->term, log->s);
+		rinfo(s, "commit log%d! LOG{T%d:%12s}\n", i, log->term, log->s);
 	}
 
 	s->lastApplied = s->commitIndex;
@@ -427,6 +427,8 @@ getN(RAFTSERVER *s) {
 static void
 recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc) {
 	int n;
+
+	rinfo(s, "recv appendetnries!!!!!!!!!!!!!!!! from %d\n", from->peerid);
 
 	if (((RPC *)rpc)->term < s->curterm)
 		return;
