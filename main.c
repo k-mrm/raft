@@ -653,6 +653,20 @@ tickinit(RAFTSERVER *s, void (*callback)(union sigval)) {
 	return 0;
 }
 
+static RAFTPEER *
+allocpeer(RAFTSERVER *s) {
+	RAFTPEER *p;
+
+	for (p = s->peers; p < &s->peers[8]; p++) {
+		if (!p->active) {
+			p->active = true;
+			return p;
+		}
+	}
+
+	return NULL;
+}
+
 static void
 connectallserv(RAFTSERVER *s, int nservs) {
 	int peeridx = 0;
@@ -675,14 +689,19 @@ connectallserv(RAFTSERVER *s, int nservs) {
 			goto cnctd;
 		}
 
-		peer = &s->peers[peeridx];
-		ch = tcpConnect(iplist[i], 1145);
+		ch = tcpConnect(iplist[i], 1145, 0);
 		if (ch) {
 			connected |= 1 << i;
+
+			peer = allocpeer(s);
+			if (!peer) {
+				printf("no peer\n");
+				return;
+			}
+
 			peer->wrch = ch;
 			peer->peerid = i;
 			peer->addr = ch->addr;
-			peer->active = true;
 			peeridx++;
 		}
 
@@ -847,6 +866,11 @@ raftpollfd(RAFTSERVER *s, struct pollfd *fds, RAFTPEER **peers) {
 	return nfds;
 }
 
+static void
+peerReconnected(RAFTSERVER *s, TCP *ch) {
+	;
+}
+
 static int
 servermain(RAFTSERVER *s) {
 	int nready;
@@ -882,12 +906,17 @@ servermain(RAFTSERVER *s) {
 			if (!rdch)
 				return -1;
 
-			peer = peerbyip(s, rdch->addr);
-			if (peer && !peer->rdch) {
-				peer->rdch = rdch;
-				rinfo(s, "new peer!: %d\n", peer->peerid);
-			} else {
+			// from client
+			if (ntohs(rdch->addr.sin_port) == 1919) {
 				newClient(s, rdch);
+			} else {
+				peer = peerbyip(s, rdch->addr);
+				if (peer) {
+					peer->rdch = rdch;
+					rinfo(s, "new peer!: %d\n", peer->peerid);
+				} else {
+					peerReconnected(s, rdch);
+				}
 			}
 		} else if (s->client && pfd->fd == s->client->ch->fd) {
 			recvClientReq(s);

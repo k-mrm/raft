@@ -52,9 +52,12 @@ tcpFree(TCP *t) {
 }
 
 TCP *
-tcpConnect(const char *host, int port) {
+tcpConnect(const char *host, int port, int myport) {
 	int sock;
+	int yes = 1;
 	TCP *t;
+	struct sockaddr_in sin;
+	socklen_t sin_len = sizeof sin;
 	struct addrinfo hint = {0}, *res;
 	char port_s[8];
 	char s[32];
@@ -72,6 +75,24 @@ tcpConnect(const char *host, int port) {
 		// perror("socket");
 		return NULL;
 	}
+
+	if (myport) {
+		if (getsockname(sock, (struct sockaddr *)&sin, &sin_len) < 0) {
+			perror("getsockname");
+			goto err;
+		}
+		sin.sin_port = htons(myport);
+
+		if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
+			perror("setsockopt");
+			goto err;
+		}
+		if(bind(sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+			perror("bind");
+			goto err;
+		}
+	}
+
 	if(connect(sock, res->ai_addr, res->ai_addrlen) < 0)
 		goto err;
 

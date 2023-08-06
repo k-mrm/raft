@@ -44,7 +44,7 @@ clientmain() {
 
 static int
 doClient(char *servIp) {
-	serv = tcpConnect(servIp, 1145);
+	serv = tcpConnect(servIp, 1145, 1919);
 	if (!serv)
 		return -1;
 
