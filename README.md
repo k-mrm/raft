@@ -5,6 +5,7 @@
 - make
 ```
 $ make raft
+$ make client
 ```
 
 - prepare environment (require sudo)

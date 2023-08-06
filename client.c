@@ -20,7 +20,7 @@ sighandler(int sig) {
 static int
 clientmain() {
 	char msg[12];
-	size_t s
+	size_t s;
 
 	while (!terminated) {
 		printf("> ");
