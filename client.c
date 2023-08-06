@@ -14,6 +14,7 @@ int terminated = 0;
 
 static void
 sighandler(int sig) {
+	(void)sig;
 	terminated = 1;
 }
 
@@ -21,10 +22,13 @@ static int
 clientmain() {
 	char msg[12];
 	size_t s;
+	int r;
 
 	while (!terminated) {
 		printf("> ");
-		scanf("%12s", msg);
+		r = scanf("%12s", msg);
+		if (r == EOF)
+			break;
 		s = tcpSend(serv, msg, sizeof msg);
 		if (s == 0)
 			break;
