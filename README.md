@@ -23,3 +23,9 @@ $ ./raft 1
 $ sudo ip netns exec host2 bash
 $ ./raft 2
 ```
+
+  - client
+```
+# in console 4
+$ ./client <leader's ip>
+```
