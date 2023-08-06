@@ -15,7 +15,8 @@
 
 #define min(a, b)	((a) < (b) ? (a) : (b))
 
-char *iplist[3] = {
+#define N	3
+char *iplist[N] = {
 	"10.0.0.100",
 	"10.0.0.1",
 	"10.0.0.2",
@@ -241,14 +242,13 @@ recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 	reply.rpc.type = REQUEST_VOTE_REPLY;
 	rinfo(s, "recv requestvote from: %d(T%d)\n", from->peerid, ((RPC *)rpc)->term);
 
-	// TODO
-	assert(s->state != LEADER);
-
 	if (((RPC *)rpc)->term >= s->curterm) {
 		rinfo(s, "recv request vote from newer peer\n");
 		if (s->state == FOLLOWER) {
-			// TODO: validate lastLogindex/term
-			validvote = true;
+			// validate lastLogindex/term
+			if (rpc->lastLogindex >= s->logIndex) {
+				validvote = true;
+			}
 		} else {	// candidate
 			s->state = FOLLOWER;
 			voteDone(s);
@@ -349,6 +349,7 @@ logDump(LOG *log, int n) {
 
 static void
 appendLog(RAFTSERVER *s, LOG *log) {
+	log->term = s->curterm;
 	s->logIndex++;
 	s->log[s->logIndex] = *log;
 }
@@ -361,7 +362,8 @@ commit(RAFTSERVER *s) {
 	start = s->lastApplied + 1;
 	for (int i = start; i <= s->commitIndex; i++) {
 		log = s->log + i;
-		rinfo(s, "commit log%d! LOG{T%d}\n", i, log->term);
+		// TODO: do cmd
+		rinfo(s, "commit log%d! LOG{T%d:%s}\n", i, log->term, log->s);
 	}
 
 	s->lastApplied = s->commitIndex;
@@ -397,7 +399,6 @@ recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 
 		if (rpc->leaderCommit > s->commitIndex) {
 			s->commitIndex = min(rpc->leaderCommit, s->logIndex);
-			commit(s);
 		}
 	}
 
@@ -408,6 +409,8 @@ recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 static int
 getN(RAFTSERVER *s) {
 	int count;
+	bool major;
+	RAFTPEER *p;
 	int maxN = -1;
 
 	for (int n = s->commitIndex + 1; n <= s->logIndex; n++) {
@@ -415,10 +418,14 @@ getN(RAFTSERVER *s) {
 		foreachPeer(s, p) {
 			if (p->matchIndex >= n) {
 				count++;
+				if (count * 2 > s->npeers + 1) {
+					major = true;
+					break;
+				}
 			}
 		}
 		// count is major and same term
-		if ((count * 2 > s->npeers + 1) && s->log[n].term == s->curterm) {
+		if (major && s->log[n].term == s->curterm) {
 			maxN = n;
 		}
 	}
@@ -429,7 +436,6 @@ getN(RAFTSERVER *s) {
 static void
 recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc) {
 	int n;
-	RAFTPEER *p;
 
 	if (((RPC *)rpc)->term < s->curterm)
 		return;
@@ -454,7 +460,6 @@ recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc)
 		n = getN(s);
 		if (n >= 0) {
 			s->commitIndex = n;
-			commit(s);
 		}
 	} else {
 		// resend append entries
@@ -759,8 +764,9 @@ newClient(RAFTSERVER *s, TCP *ch) {
 	}
 
 	c = malloc(sizeof *c);
-	if (!c)
+	if (!c) {
 		return;
+	}
 
 	rinfo(s, "new client!\n");
 
@@ -840,11 +846,14 @@ servermain(RAFTSERVER *s) {
 	int nfds;
 	int timeout = heartbeatTimeout(s);
 
-	nfds = raftpollfd(s, fds, peers);
+	commit(s);
 
+	nfds = raftpollfd(s, fds, peers);
 	nready = poll(fds, nfds, timeout);
-	if (nready < 0)
+	if (nready < 0) {
+		perror("poll");
 		return -1;
+	}
 	if (!nready) {
 		rinfo(s, "timeout: %d ms\n", timeout);
 		doHeartbeatTimeout(s);
@@ -885,13 +894,12 @@ int
 main(int argc, char *argv[]) {
 	RAFTSERVER server;
 	int rc, me;
-	int n = 3;
 
 	if (argc < 2)
 		return -1;
 	me = atoi(argv[1]);
 
-	rc = serverinit(&server, me, n);
+	rc = serverinit(&server, me, N);
 	if (rc)
 		return rc;
 	
