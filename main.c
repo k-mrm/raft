@@ -11,6 +11,8 @@
 #include <arpa/inet.h>
 #include "tcp.h"
 
+#define min(a, b)	((a) < (b) ? (a) : (b))
+
 char *iplist[3] = {
 	"10.0.0.100",
 	"10.0.0.1",
@@ -41,7 +43,8 @@ struct RAFTPEER {
 	struct sockaddr_in addr;
 	int peerid;
 
-	int logIndex;
+	int nextIndex;
+	int matchIndex;
 
 	bool active;
 };
@@ -113,13 +116,14 @@ struct RAFTSERVER {
 
 	int curterm;	// currentTerm
 
-	int votes;
-	bool voted;	// already voted?
+	int votes;	// got votes
+	int votefor;	// candidate id
 
 	// log
 	LOG log[256];
 	int logIndex;
 	int commitIndex;
+	int lastApplied;
 
 	CLIENT *client;
 };
@@ -169,7 +173,7 @@ struct APPEND_ENTRIES_REP_RPC {
 	bool success;
 };
 
-#define rlog(s, fmt, ...)	\
+#define rinfo(s, fmt, ...)	\
 	printf("R%d[%s] (Term%d): " fmt, (s)->myid, st[(s)->state], (s)->curterm, ##__VA_ARGS__)
 
 static void
@@ -179,14 +183,27 @@ bzero(void *buf, size_t s) {
 
 static void
 setCurTerm(RAFTSERVER *s, int curterm) {
-	rlog(s, "update Term: -> %d\n", curterm);
+	rinfo(s, "update Term: -> %d\n", curterm);
 	s->curterm = curterm;
+}
+
+static void
+becomeLeader(RAFTSERVER *s) {
+	RAFTPEER *p;
+
+	s->state = LEADER;
+	s->leader = NULL;
+
+	foreachPeer (s, p) {
+		p->nextIndex = s->logIndex;
+		p->matchIndex = -1;
+	}
 }
 
 static void
 voteDone(RAFTSERVER *s) {
 	s->votes = 0;
-	s->voted = false;
+	s->votefor = -1;
 }
 
 static RAFTPEER *
@@ -245,14 +262,15 @@ recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 	bool validvote = false;
 
 	reply.rpc.type = REQUEST_VOTE_REPLY;
-	rlog(s, "recv requestvote from: %d(T%d)\n", from->peerid, ((RPC *)rpc)->term);
+	rinfo(s, "recv requestvote from: %d(T%d)\n", from->peerid, ((RPC *)rpc)->term);
 
 	// TODO
 	assert(s->state != LEADER);
 
 	if (((RPC *)rpc)->term >= s->curterm) {
-		rlog(s, "recv request vote from newer peer\n");
+		rinfo(s, "recv request vote from newer peer\n");
 		if (s->state == FOLLOWER) {
+			// TODO: validate lastLogindex/term
 			validvote = true;
 		} else {	// candidate
 			s->state = FOLLOWER;
@@ -261,12 +279,12 @@ recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 		setCurTerm(s, ((RPC *)rpc)->term);
 	}
 
-	if (!s->voted && validvote) {
-		s->voted = true;
+	if (s->votefor < 0 && validvote) {
+		s->votefor = from->peerid;
 		vote = true;
-		rlog(s, "voted to %d\n", from->peerid);
+		rinfo(s, "voted for %d\n", s->votefor);
 	} else {
-		rlog(s, "cannot vote to %d\n", from->peerid);
+		rinfo(s, "cannot vote to %d\n", from->peerid);
 	}
 
 	reply.voteGranted = vote;
@@ -283,16 +301,15 @@ voteme(RAFTSERVER *s) {
 	s->votes++;
 
 	if (isMajority(s)) {
-		rlog(s, "won vote! become a leader\n");
-		s->state = LEADER;
-		s->leader = NULL;	// leader is me
+		rinfo(s, "won vote! become a leader\n");
+		becomeLeader(s);
 		voteDone(s);
 	}
 }
 
 static void
 recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
-	rlog(s, "recv requestvote reply! %d(T%d)\n", from->peerid, ((RPC *)rpc)->term);
+	rinfo(s, "recv requestvote reply! %d(T%d)\n", from->peerid, ((RPC *)rpc)->term);
 
 	// rpc is too late
 	if (((RPC *)rpc)->term < s->curterm)
@@ -300,7 +317,7 @@ recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
 
 	// my raftserver is old
 	if (((RPC *)rpc)->term > s->curterm) {
-		rlog(s, "vote from newer peer: %d Term:%d\n",
+		rinfo(s, "vote from newer peer: %d Term:%d\n",
 		     from->peerid, ((RPC *)rpc)->term);
 		setCurTerm(s, ((RPC *)rpc)->term);
 		s->state = FOLLOWER;
@@ -309,7 +326,7 @@ recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
 	}
 
 	if (rpc->voteGranted) {
-		rlog(s, "voted from %d\n", from->peerid);
+		rinfo(s, "voted from %d\n", from->peerid);
 		voteme(s);
 	}
 }
@@ -328,7 +345,7 @@ recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 
 	if (s->state == CANDIDATE || s->state == LEADER) {
 		// other peer became LEADER
-		rlog(s, "now leader is %d!!!!!!!!!!\n", from->peerid);
+		rinfo(s, "now leader is %d!!!!!!!!!!\n", from->peerid);
 		s->state = FOLLOWER;
 		voteDone(s);
 	}
@@ -336,7 +353,7 @@ recvHeartbeat(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	s->leader = from;
 	if (prevleader != s->leader) {
 		int pid = prevleader ? prevleader->peerid : -1;
-		rlog(s, "leader changed: %d -> %d\n", pid, s->leader->peerid);
+		rinfo(s, "leader changed: %d -> %d\n", pid, s->leader->peerid);
 	}
 }
 
@@ -353,10 +370,28 @@ logDump(LOG *log, int n) {
 }
 
 static void
+appendLog(RAFTSERVER *s, LOG *log) {
+	s->log[s->logIndex++] = *log;
+}
+
+static void
+commit(RAFTSERVER *s) {
+	int start;
+	LOG *log;
+
+	start = s->lastApplied + 1;
+	for (int i = start; i <= s->commitIndex; i++) {
+		log = s->log + i;
+		rinfo(s, "commit log%d! LOG{T%d}\n", i, log->term);
+	}
+
+	s->lastApplied = s->commitIndex;
+}
+
+static void
 recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	APPEND_ENTRIES_REP_RPC reply;
 	LOG *entry;
-	int index;
 	
 	if (((RPC *)rpc)->term < s->curterm)
 		return;
@@ -371,17 +406,18 @@ recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	reply.rpc.type = APPEND_ENTRIES_REPLY;
 	reply.success = false;
 
-	if (rpc->prevLogIndex < 0 ||
+	if (rpc->prevLogIndex == -1 ||
 	    s->log[rpc->prevLogIndex].term == rpc->prevLogTerm) {
-		index = rpc->prevLogIndex + 1;
 		foreachLog(entry, rpc->entries, 32) {
-			s->log[index] = *entry;
-			index++;
+			appendLog(s, entry);
 		}
 
 		reply.success = true;
 
-		// TODO: commitIndex
+		if (rpc->leaderCommit > s->commitIndex) {
+			s->commitIndex = min(rpc->leaderCommit, s->logIndex - 1);
+			commit(s);
+		}
 	}
 
 	sendrpc(s, (RPC *)&reply, sizeof reply, from);
@@ -392,7 +428,20 @@ recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc)
 	if (((RPC *)rpc)->term < s->curterm)
 		return;
 
-	printf("recv append entries reply!\n");
+	assert(s->state == LEADER);
+
+	if (((RPC *)rpc)->term > s->curterm) {
+		setCurTerm(s, ((RPC *)rpc)->term);
+		s->state = FOLLOWER;
+		return;
+	}
+
+	if (rpc->success) {
+		;
+	} else {
+		// resend append entries
+		;
+	}
 }
 
 static void
@@ -424,7 +473,7 @@ recvrpc(RAFTSERVER *s, RAFTPEER *from) {
 }
 
 static void
-rpcbcast(RAFTSERVER *s, RPC *rpc, size_t size) {
+bcastrpc(RAFTSERVER *s, RPC *rpc, size_t size) {
 	RAFTPEER *peer;
 
 	foreachPeer(s, peer) {
@@ -433,54 +482,75 @@ rpcbcast(RAFTSERVER *s, RPC *rpc, size_t size) {
 }
 
 static void
-newLog(RAFTSERVER *s, LOG *log) {
-	s->log[s->logIndex] = *log;
-}
-
-static void
 requestVote(RAFTSERVER *s) {
 	REQUEST_VOTE_RPC rpc;
 
 	if (s->state != CANDIDATE)
 		return;
-	rlog(s, "request vote\n");
+	rinfo(s, "request vote\n");
 
 	rpc.rpc.type = REQUEST_VOTE;
 	rpc.candidateId = s->myid;
 	rpc.lastLogindex = 0;
 	rpc.lastLogterm = 0;
 
-	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
+	bcastrpc(s, (RPC *)&rpc, sizeof rpc);
+}
+
+static RPC *
+allocrpc(RPCTYPE type, size_t size) {
+	RPC *rpc;
+
+	rpc = malloc(size);
+	if (!rpc)
+		return NULL;
+
+	bzero(rpc, size);
+	rpc->type = type;
+	return rpc;
 }
 
 static void
 appendEntries(RAFTSERVER *s, bool heartbeat) {
-	APPEND_ENTRIES_RPC rpc;
-	int prevLogIndex;
-	LOG *log;
+	APPEND_ENTRIES_RPC *rpc;
+	RAFTPEER *p;
+	int prevLogIndex, prevLogTerm;
+	int next, eidx = 0;
 
 	if (s->state != LEADER)
 		return;
 
-	rpc.rpc.type = APPEND_ENTRIES;
-	rpc.leaderId = s->myid;
 	prevLogIndex = s->logIndex - 1;
-	rpc.prevLogIndex = prevLogIndex;
 	if (prevLogIndex >= 0)
-		rpc.prevLogTerm = s->log[prevLogIndex].term;
+		prevLogTerm = s->log[prevLogIndex].term;
 	else
-		rpc.prevLogTerm = -1;
-	rpc.leaderCommit = s->commitIndex;
+		prevLogTerm = -1;
 
-	if (heartbeat) {
-		bzero(rpc.entries, sizeof rpc.entries);
-	} else {
-		// FIXME
-		// log = s->log + s->logIndex;
-		// memcpy(rpc.entries, log, sizeof(LOG) * n);
+	foreachPeer(s, p) {
+		rpc = (APPEND_ENTRIES_RPC *)allocrpc(APPEND_ENTRIES, sizeof *rpc);
+		rpc->leaderId = s->myid;
+		rpc->prevLogIndex = prevLogIndex;
+		rpc->prevLogTerm = prevLogTerm;
+		rpc->leaderCommit = s->commitIndex;
+
+		if (heartbeat) {
+			bcastrpc(s, (RPC *)rpc, sizeof *rpc);
+			free(rpc);
+			return;
+		}
+
+		next = p->nextIndex;
+		eidx = 0;
+		for (int i = next; i < s->logIndex; i++, eidx++) {
+			if (eidx >= 32)
+				return;
+			LOG *l = rpc->entries + eidx;
+			*l = s->log[i];
+		}
+
+		sendrpc(s, (RPC *)rpc, sizeof *rpc, p);
+		free(rpc);
 	}
-
-	rpcbcast(s, (RPC *)&rpc, sizeof rpc);
 }
 
 static void
@@ -597,6 +667,8 @@ serverinit(RAFTSERVER *s, int myid, int nservs) {
 	s->htimeoutHi = 250;		// heartbeat timeout is 100-250 ms
 	s->heartbeatTick = 50;		// heartbeat per 50 ms
 	s->npeers = 0;
+	s->commitIndex = -1;
+	s->lastApplied = -1;
 
 	sock = tcpListen(myip, port);	// establish tcp connection
 	if (sock < 0) {
@@ -622,10 +694,10 @@ static void
 election(RAFTSERVER *s) {
 	setCurTerm(s, s->curterm + 1);
 
-	rlog(s, "voted to me!\n");
+	rinfo(s, "voted to me!\n");
 
 	voteme(s);
-	s->voted = true;
+	s->votefor = s->myid;
 
 	requestVote(s);
 }
@@ -636,7 +708,7 @@ doHeartbeatTimeout(RAFTSERVER *s) {
 		return;
 
 	if (s->state == CANDIDATE) {
-		rlog(s, "reelection\n");
+		rinfo(s, "reelection\n");
 		voteDone(s);
 	}
 
@@ -646,11 +718,19 @@ doHeartbeatTimeout(RAFTSERVER *s) {
 
 static void
 newClient(RAFTSERVER *s, TCP *ch) {
-	CLIENT *c = malloc(sizeof *c);
+	CLIENT *c;
+	
+	if (s->state != LEADER) {
+		rinfo(s, "I'm not a leader!\n");
+		tcpDisconnected(ch);
+		return;
+	}
+
+	c = malloc(sizeof *c);
 	if (!c)
 		return;
 
-	rlog(s, "new client!\n");
+	rinfo(s, "new client!\n");
 
 	c->ch = ch;
 	if (s->client)
@@ -665,6 +745,27 @@ clientDisconnected(RAFTSERVER *s) {
 	tcpDisconnected(c->ch);
 	free(c);
 	s->client = NULL;
+}
+
+static void
+recvClientReq(RAFTSERVER *s) {
+	CLIENT *c = s->client;
+	LOG buf;
+	size_t n;
+
+	if (s->state != LEADER) {
+		rinfo(s, "I'm not a leader, disconnect\n");
+		clientDisconnected(s);
+		return;
+	}
+	
+	n = tcpRecv(c->ch, &buf, sizeof buf);
+	if (n == 0) {
+		clientDisconnected(s);
+		return;
+	}
+
+	logDump(&buf, 1);
 }
 
 static int
@@ -711,7 +812,7 @@ servermain(RAFTSERVER *s) {
 	if (nready < 0)
 		return -1;
 	if (!nready) {
-		rlog(s, "timeout: %d ms\n", timeout);
+		rinfo(s, "timeout: %d ms\n", timeout);
 		doHeartbeatTimeout(s);
 		return 0;
 	}
@@ -729,12 +830,12 @@ servermain(RAFTSERVER *s) {
 			peer = peerbyip(s, rdch->addr);
 			if (peer) {
 				peer->rdch = rdch;
-				rlog(s, "new peer!: %d\n", peer->peerid);
+				rinfo(s, "new peer!: %d\n", peer->peerid);
 			} else {
 				newClient(s, rdch);
 			}
 		} else if (s->client && pfd->fd == s->client->ch->fd) {
-			printf("client nanka kita w\n");
+			recvClientReq(s);
 		} else {
 			peer = peers[i - 1];
 			recvrpc(s, peer);
