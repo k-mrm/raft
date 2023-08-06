@@ -268,8 +268,6 @@ recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 	if (((RPC *)rpc)->term == s->curterm) {
 		if (peerIsMoreUptoDate(s, rpc->lastLogIndex, rpc->lastLogTerm)) {
 			validvote = true;
-		} else {
-			rinfo(s, "log owattemasu\n");
 		}
 	}
 
@@ -278,7 +276,7 @@ recvRequestVote(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_RPC *rpc) {
 		vote = true;
 		rinfo(s, "voted for %d\n", s->votefor);
 	} else {
-		rinfo(s, "cannot vote to %d\n", from->peerid);
+		rinfo(s, "cannot vote for %d\n", from->peerid);
 	}
 
 	reply.voteGranted = vote;
@@ -295,7 +293,7 @@ voteme(RAFTSERVER *s) {
 	s->votes++;
 
 	if (isMajority(s)) {
-		rinfo(s, "won vote! become a leader\n");
+		rinfo(s, "won vote! become a leader: ./client %s\n", s->ipaddr);
 		becomeLeader(s);
 		voteDone(s);
 	}
@@ -303,8 +301,6 @@ voteme(RAFTSERVER *s) {
 
 static void
 recvRequestVoteRep(RAFTSERVER *s, RAFTPEER *from, REQUEST_VOTE_REP_RPC *rpc) {
-	rinfo(s, "recv requestvote reply! %d(T%d)\n", from->peerid, ((RPC *)rpc)->term);
-
 	// rpc is too late
 	if (((RPC *)rpc)->term < s->curterm)
 		return;
@@ -378,8 +374,6 @@ recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 	    s->log[rpc->prevLogIndex].term == rpc->prevLogTerm) {
 		reply.success = true;
 
-		rinfo(s, "yes appendEntires\n");
-
 		// TODO: confilict check
 
 		foreachLog(entry, rpc->entries, 32) {
@@ -389,8 +383,6 @@ recvAppendEntries(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_RPC *rpc) {
 		if (rpc->leaderCommit > s->commitIndex) {
 			s->commitIndex = min(rpc->leaderCommit, s->logIndex);
 		}
-	} else {
-		rinfo(s, "fail!\n");
 	}
 
 	sendrpc(s, (RPC *)&reply, sizeof reply, from);
@@ -427,8 +419,6 @@ getN(RAFTSERVER *s) {
 static void
 recvAppendEntriesRep(RAFTSERVER *s, RAFTPEER *from, APPEND_ENTRIES_REP_RPC *rpc) {
 	int n;
-
-	rinfo(s, "recv appendetnries!!!!!!!!!!!!!!!! from %d\n", from->peerid);
 
 	if (((RPC *)rpc)->term < s->curterm)
 		return;
@@ -469,7 +459,7 @@ recvrpc(RAFTSERVER *s, RAFTPEER *from) {
 	if (rpcsize == 0)
 		peerDisconnect(s, from);
 
-	if (s->state != FOLLOWER && rpc->term > s->curterm) {
+	if (rpc->term > s->curterm) {
 		setCurTerm(s, ((RPC *)rpc)->term);
 		s->state = FOLLOWER;
 		s->leader = from;
@@ -769,7 +759,7 @@ newClient(RAFTSERVER *s, TCP *ch) {
 	CLIENT *c;
 	
 	if (s->state != LEADER) {
-		rinfo(s, "I'm not a leader!\n");
+		rinfo(s, "I'm not a leader! Disconnect\n");
 		tcpDisconnect(ch);
 		return;
 	}
@@ -811,6 +801,15 @@ recvClientReq(RAFTSERVER *s) {
 	n = tcpRecv(c->ch, log.s, sizeof log.s);
 	if (n == 0) {
 		clientDisconnect(s);
+		return;
+	}
+
+	// internal command
+	if (strcmp(log.s, "p") == 0) {
+		logDump(s->log, 256);
+		return;
+	} else if (strcmp(log.s, "c") == 0) {
+		logDump(s->log, s->commitIndex + 1);
 		return;
 	}
 
@@ -868,7 +867,7 @@ servermain(RAFTSERVER *s) {
 		return -1;
 	}
 	if (!nready) {
-		rinfo(s, "timeout: %d ms\n", timeout);
+		// rinfo(s, "timeout: %d ms\n", timeout);
 		doHeartbeatTimeout(s);
 		return 0;
 	}
